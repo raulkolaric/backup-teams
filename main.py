@@ -105,7 +105,8 @@ def get_classes(page):
 
                 classes.append({
                     "name": name,
-                    "id": team_id
+                    "id": team_id,
+                    "tid": tid
                 })
                 print(f" - {name}")
             except Exception as e:
@@ -116,6 +117,25 @@ def get_classes(page):
     except Exception as e:
         print(f"Erro ao buscar classes: {e}")
         return []
+
+def enter_class(page, team_class):
+    print(f"\nEntrando na classe: {team_class['name']}...")
+    try:
+        # Localiza o card pelo data-tid que salvamos
+        card_selector = f'[data-tid="{team_class["tid"]}"]'
+        page.wait_for_selector(card_selector, timeout=10000)
+        
+        human_delay(page)
+        # Clica no card para entrar
+        page.click(card_selector)
+        
+        # Espera a navegação (o Teams muda a URL quando você entra em um time)
+        page.wait_for_load_state("networkidle")
+        print("Sucesso ao entrar na classe.")
+        return True
+    except Exception as e:
+        print(f"Erro ao entrar na classe: {e}")
+        return False
 
 def run():
     with sync_playwright() as p:
@@ -165,6 +185,8 @@ def run():
         
         if classes:
             print(f"\nTotal de classes encontradas: {len(classes)}")
+            # Entra na primeira classe da lista para testar a navegação
+            enter_class(page, classes[0])
         else:
             print("\nNenhuma classe encontrada ou erro no seletor.")
 
