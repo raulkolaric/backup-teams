@@ -1,33 +1,104 @@
 """
 src/auth.py — Playwright-based login and Bearer token extraction.
 
-Strategy
---------
-1. Load state.json if it exists (re-uses a previous authenticated session).
-2. Navigate to teams.microsoft.com.
-3. If redirected to the Microsoft login page, fill in EMAIL/PASSWORD from .env.
-4. Intercept every outgoing request header: the first request to
-   graph.microsoft.com that carries "Authorization: Bearer ..." gives us
-   the live token. We grab it and immediately close the browser.
-5. Save the updated session to state.json for next time.
+Strategy (Teams v2)
+-------------------
+Teams v2 calls `authsvc/v1.0/authz` during startup. The RESPONSE body
+contains a JSON payload with access tokens for different Microsoft services.
+We intercept that response and pull out the token intended for
+graph.microsoft.com — that's the one we need for all our API calls.
 
-The token is valid for ~1 hour. teams_scraper.py will call get_bearer_token()
-again automatically if it receives a 401 during a run.
+Fallback: if the response body doesn't have a recognisable structure, we also
+watch for any direct request to graph.microsoft.com that carries a Bearer
+header (works for some tenant configurations).
 """
+import json
 import os
 import logging
 from pathlib import Path
 from typing import Optional
 
-from playwright.sync_api import sync_playwright, Page, BrowserContext
+from playwright.sync_api import sync_playwright, Page, BrowserContext, Response
 
 log = logging.getLogger("backup_teams.auth")
 
 STATE_FILE = "state.json"
-TEAMS_URL  = "https://teams.microsoft.com"
+TEAMS_URL  = "https://teams.microsoft.com/v2/"
+
+# Authsvc endpoint that distributes tokens during Teams startup
+_AUTHSVC_URL = "authsvc/v1.0/authz"
+
+# Fallback: direct Graph API requests
+_GRAPH_DOMAIN = "graph.microsoft.com"
 
 
 # ─── Internal helpers ──────────────────────────────────────────────────────────
+
+def _extract_from_authsvc_body(body: bytes) -> Optional[str]:
+    """
+    Parse the authsvc response body and return the graph-scope access token.
+
+    Teams authsvc returns a JSON array of token objects, each with
+    an "application" key and a "token" key, e.g.:
+        [{"application": "graph", "token": "eyJ…"}, …]
+
+    Some tenants wrap this in {"tokens": […]}.
+    We also accept any "eyJ…" token whose audience claim ("aud") contains
+    "graph.microsoft.com" after base64 decoding the JWT payload.
+    """
+    try:
+        data = json.loads(body)
+    except Exception:
+        return None
+
+    # Normalise to a flat list of candidate token objects
+    candidates = []
+    if isinstance(data, list):
+        candidates = data
+    elif isinstance(data, dict):
+        for key in ("tokens", "value", "accessTokens"):
+            if isinstance(data.get(key), list):
+                candidates = data[key]
+                break
+
+    if not candidates:
+        return None
+
+    # Priority 1 — explicit "graph" application tag
+    for item in candidates:
+        if isinstance(item, dict):
+            app = str(item.get("application", "")).lower()
+            token = item.get("token") or item.get("accessToken") or item.get("value")
+            if token and isinstance(token, str) and token.startswith("ey"):
+                if "graph" in app:
+                    return token
+
+    # Priority 2 — JWT whose payload "aud" claim targets graph
+    for item in candidates:
+        if isinstance(item, dict):
+            token = item.get("token") or item.get("accessToken") or item.get("value")
+            if token and isinstance(token, str) and token.startswith("ey"):
+                if _jwt_aud_is_graph(token):
+                    return token
+
+    return None
+
+
+def _jwt_aud_is_graph(token: str) -> bool:
+    """Decode the JWT payload (base64) and check if aud contains graph."""
+    import base64
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return False
+        # Add padding
+        payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        aud = payload.get("aud", "")
+        return "graph" in str(aud).lower()
+    except Exception:
+        return False
+
 
 def _do_login(page: Page) -> bool:
     """Fill in credentials on the Microsoft login page."""
@@ -47,13 +118,13 @@ def _do_login(page: Page) -> bool:
         page.wait_for_timeout(1_200)
         page.click("#idSIButton9")
 
-        # "Stay signed in?" prompt — click Yes
+        # "Stay signed in?" prompt
         try:
             page.click("#idSIButton9", timeout=6_000)
         except Exception:
             pass
 
-        # Prefer the web app over the desktop client redirect
+        # Prefer web app over desktop client
         try:
             page.locator(
                 'text=/Use (o aplicativo Web|the web app) em vez disso|instead/i'
@@ -67,22 +138,12 @@ def _do_login(page: Page) -> bool:
         return False
 
 
-def _extract_token_from_request(request) -> Optional[str]:
-    """Return the Bearer token from a Graph API request header, or None."""
-    if "graph.microsoft.com" not in request.url:
-        return None
-    auth = request.headers.get("authorization", "")
-    if auth.startswith("Bearer "):
-        return auth[len("Bearer "):]
-    return None
-
-
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def get_bearer_token() -> str:
     """
-    Launch Chromium, log in (or resume session), intercept the first Graph API
-    Bearer token, then close the browser and return the token string.
+    Launch Chromium, log in (or resume session), capture the Graph API token
+    from the authsvc response body, close the browser, return the token.
 
     Raises RuntimeError if no token is captured within the timeout.
     """
@@ -91,7 +152,6 @@ def get_bearer_token() -> str:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
 
-        # Re-use saved session if available
         if Path(STATE_FILE).exists():
             log.info("Resuming saved browser session from %s", STATE_FILE)
             context: BrowserContext = browser.new_context(storage_state=STATE_FILE)
@@ -101,48 +161,72 @@ def get_bearer_token() -> str:
 
         page = context.new_page()
 
-        # Intercept every request to catch the token as early as possible
-        def on_request(request):
-            if not captured:
-                tok = _extract_token_from_request(request)
-                if tok:
-                    log.info("Bearer token captured ✓")
-                    captured.append(tok)
+        # ── Strategy 1: intercept authsvc RESPONSE body ───────────────────────
+        def on_response(response: Response):
+            if captured:
+                return
+            if _AUTHSVC_URL not in response.url:
+                return
+            try:
+                body = response.body()
+                token = _extract_from_authsvc_body(body)
+                if token:
+                    log.info("Graph token extracted from authsvc response ✓")
+                    captured.append(token)
+                else:
+                    log.debug("authsvc response didn't contain a graph token (trying fallback)")
+            except Exception as exc:
+                log.debug("Could not read authsvc response: %s", exc)
 
-        page.on("request", on_request)
+        # ── Strategy 2 (fallback): direct Graph API request header ────────────
+        def on_request(request):
+            if captured:
+                return
+            if _GRAPH_DOMAIN not in request.url:
+                return
+            auth = request.headers.get("authorization", "")
+            if auth.startswith("Bearer ey"):
+                token = auth[len("Bearer "):]
+                log.info("Graph token captured from direct Graph request ✓")
+                captured.append(token)
+
+        page.on("response", on_response)
+        page.on("request",  on_request)
 
         log.info("Navigating to Teams…")
         page.goto(TEAMS_URL)
         page.wait_for_timeout(4_000)
 
-        # If we ended up on the login page, authenticate
-        if any(
-            host in page.url
-            for host in ("login.microsoftonline.com", "login.live.com")
-        ):
+        # Handle login redirect
+        if any(host in page.url for host in ("login.microsoftonline.com", "login.live.com")):
             log.info("Login page detected — authenticating…")
             _do_login(page)
             log.info("Waiting for Teams to load (up to 5 min for 2FA)…")
-            page.wait_for_url(f"{TEAMS_URL}/**", timeout=300_000)
-            page.wait_for_timeout(4_000)
+            base = TEAMS_URL.rstrip("/")
+            page.wait_for_url(f"{base}/**", timeout=300_000)
+            page.wait_for_timeout(5_000)
 
-        # Wait up to 30 s for a Graph API call to appear so we can grab the token
-        for _ in range(30):
+        # Wait up to 30 s — authsvc fires automatically on Teams startup
+        log.info("Teams loaded — waiting for Graph token from authsvc (up to 30s)…")
+        for i in range(30):
             if captured:
                 break
-            # Trigger a navigation that forces Graph API calls
-            page.goto(f"{TEAMS_URL}/_#/school/teams")
             page.wait_for_timeout(1_000)
+            if i == 15 and not captured:
+                log.info("Still waiting — soft-reloading page to re-trigger authsvc…")
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=15_000)
+                except Exception:
+                    pass
 
-        # Persist the session for next run before closing
         context.storage_state(path=STATE_FILE)
         log.info("Session saved to %s", STATE_FILE)
         browser.close()
 
     if not captured:
         raise RuntimeError(
-            "Could not capture a Bearer token from the Teams session. "
-            "Try deleting state.json and re-running to force a fresh login."
+            "Could not capture a Graph API Bearer token.\n"
+            "Try deleting state.json, run again, and complete login manually."
         )
 
     return captured[0]

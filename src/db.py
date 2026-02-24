@@ -29,7 +29,8 @@ async def init_pool() -> asyncpg.Pool:
     Reads DB_* variables from the environment.
     """
     dsn = (
-        f"postgresql://{os.environ['DB_USER']}:{os.environ['DB_PASSWORD']}"
+        f"postgresql://{os.environ['DB_USER']}"
+        f"{(':' + os.environ['DB_PASSWORD']) if os.environ.get('DB_PASSWORD') else ''}"
         f"@{os.environ.get('DB_HOST', 'localhost')}:{os.environ.get('DB_PORT', '5432')}"
         f"/{os.environ['DB_NAME']}"
     )
