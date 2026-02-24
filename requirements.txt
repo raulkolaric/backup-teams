@@ -1,0 +1,6 @@
+playwright
+httpx[http2]
+asyncpg
+python-dotenv
+rich
+tqdm
