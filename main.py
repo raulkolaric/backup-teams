@@ -63,32 +63,32 @@ def login(page):
         return False
 
 def get_classes(page):
-    print("\nBuscando suas classes/equipes...")
+    print("\nBuscando exclusivamente suas Classes (Turmas)...")
     
     try:
-        # Aguarda a seção de "Classes" (Educação) carregar
-        try:
-            page.wait_for_selector('[data-tid="ClassTeamsSection-panel"]', timeout=15000)
-        except:
-            print("Aviso: Seção 'ClassTeamsSection-panel' não encontrada. Tentando seletores genéricos.")
-
-        # O seletor mais confiável baseado no seu HTML para o nome da equipe
-        # <button data-testid="team-name">...<span class="fui-StyledText">NOME</span></button>
-        team_name_selector = '[data-testid="team-name"]'
+        # Alvo: O painel específico de Classes/Aulas do Teams EDU
+        class_section_selector = '[data-tid="ClassTeamsSection-panel"]'
         
-        # Espera as cartas aparecerem
-        page.wait_for_selector(team_name_selector, timeout=10000)
+        try:
+            # Espera o painel de classes carregar
+            page.wait_for_selector(class_section_selector, timeout=15000)
+        except:
+            print("Aviso: Painel de classes 'ClassTeamsSection-panel' não detectado.")
+            return []
 
-        # Rola para garantir o carregamento de todas
+        # Rola a página para garantir o carregamento de todas
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(2000)
 
-        # Captura as cartas (fui-Card) para pegar o ID e o Nome
-        # O data-tid da fui-Card contém o ID da thread da equipe
-        cards = page.query_selector_all('.fui-Card')
+        # Agora buscamos as cartas APENAS dentro do painel de classes
+        class_section = page.query_selector(class_section_selector)
+        if not class_section:
+            return []
+
+        cards = class_section.query_selector_all('.fui-Card')
         
         classes = []
-        print(f"Encontradas {len(cards)} cartas de equipe.")
+        print(f"Encontradas {len(cards)} classes acadêmicas.")
 
         for card in cards:
             try:
@@ -99,16 +99,15 @@ def get_classes(page):
                 
                 name = name_el.inner_text().strip()
                 
-                # O ID está no data-tid do card (ex: 19:xxx@thread.tacv2-team-card)
+                # O ID está no data-tid do card
                 tid = card.get_attribute("data-tid") or ""
-                # Limpa o sufixo "-team-card" se existir para ter o ID puro
                 team_id = tid.replace("-team-card", "")
 
                 classes.append({
                     "name": name,
                     "id": team_id
                 })
-                print(f" - {name} (ID: {team_id})")
+                print(f" - {name}")
             except Exception as e:
                 print(f"Erro ao processar card: {e}")
 
