@@ -137,11 +137,127 @@ def enter_class(page, team_class):
         print(f"Erro ao entrar na classe: {e}")
         return False
 
+def access_shared_files(page):
+    print("\nAcessando aba de arquivos (Shared)...")
+    try:
+        # Tenta localizar o botão/aba "Shared" ou "Arquivos"
+        shared_tab = page.locator('button[role="tab"][aria-label="Shared"], button[role="tab"][aria-label="Arquivos"], button[role="tab"]:has-text("Shared"), button[role="tab"]:has-text("Arquivos")')
+        
+        page.wait_for_selector('button[role="tab"]', timeout=15000)
+        human_delay(page)
+        
+        shared_tab.first.click()
+        print("Aba de arquivos clicada.")
+        
+        # O Teams carrega os arquivos dentro de um IFrame do SharePoint
+        # Precisamos esperar o IFrame ou os elementos do SharePoint aparecerem
+        print("Aguardando carregamento do SharePoint...")
+        
+        # Seletor genérico para a lista de arquivos do SharePoint/Teams
+        # Tentamos detectar tanto no frame principal quanto em possíveis iframes
+        file_list_selector = '[data-automationid="DetailsRow"], [role="row"][data-selection-index], .od-ItemEntity-name'
+        
+        # Loop de espera para garantir que os arquivos apareçam (pode demorar)
+        for i in range(10):
+            if page.locator(file_list_selector).count() > 0:
+                print("Lista de arquivos detectada!")
+                return True
+            
+            # Verifica se há IFrames e tenta olhar dentro deles
+            for frame in page.frames:
+                if frame.locator(file_list_selector).count() > 0:
+                    print("Lista de arquivos detectada dentro de um IFrame!")
+                    return True
+            
+            page.wait_for_timeout(2000)
+            print(f"Tentativa {i+1}/10: Aguardando arquivos...")
+            
+        print("Aviso: Arquivos não detectados após espera.")
+        return False
+    except Exception as e:
+        print(f"Erro ao acessar aba de arquivos: {e}")
+        return False
+
+def list_and_download_files(page):
+    print("\nAnalisando arquivos para download...")
+    try:
+        # Vamos buscar os arquivos tanto no frame principal quanto nos IFrames
+        all_files = []
+        
+        # Seletores de linha de arquivo do SharePoint
+        row_selector = '[data-automationid="DetailsRow"], [role="row"][data-selection-index]'
+        
+        # Função interna para extrair dados de um frame
+        def extract_from_provider(container):
+            rows = container.query_selector_all(row_selector)
+            found = []
+            for row in rows:
+                try:
+                    # Tenta pegar o nome do arquivo
+                    name_el = row.query_selector('[data-automationid="nameField"], .od-ItemEntity-name, [role="gridcell"] button')
+                    if not name_el: continue
+                    
+                    name = name_el.inner_text().strip()
+                    
+                    # Tenta pegar a data de modificação (útil para o futuro!)
+                    mod_el = row.query_selector('[data-automationid="modifiedField"], .od-ItemEntity-modified')
+                    mod_date = mod_el.inner_text().strip() if mod_el else "Desconhecida"
+                    
+                    found.append({
+                        "name": name,
+                        "element": name_el,
+                        "modified": mod_date
+                    })
+                except:
+                    continue
+            return found
+
+        # Busca no frame principal
+        all_files.extend(extract_from_provider(page))
+        
+        # Busca nos IFrames
+        for frame in page.frames:
+            all_files.extend(extract_from_provider(frame))
+
+        if not all_files:
+            print("Nenhum arquivo listado.")
+            return False
+
+        print(f"Encontrados {len(all_files)} itens.")
+        
+        # Para o futuro: Aqui compararemos com um banco de dados local
+        # Por enquanto, vamos baixar apenas o primeiro arquivo que não seja uma pasta
+        for file_info in all_files:
+            name = file_info['name']
+            # Evita pastas (geralmente não têm extensão ou têm ícone específico)
+            if "." in name:
+                print(f"Iniciando download de: {name} (Modificado em: {file_info['modified']})")
+                
+                try:
+                    with page.expect_download(timeout=60000) as download_info:
+                        human_delay(page)
+                        file_info['element'].click()
+                    
+                    download = download_info.value
+                    os.makedirs("downloads", exist_ok=True)
+                    path = os.path.join(os.getcwd(), "downloads", download.suggested_filename)
+                    download.save_as(path)
+                    print(f"Download finalizado com sucesso!")
+                    return True # Baixou um, podemos parar por agora
+                except Exception as e:
+                    print(f"Falha ao baixar {name}: {e}")
+            else:
+                print(f"Ignorando pasta: {name}")
+
+        return False
+    except Exception as e:
+        print(f"Erro ao listar arquivos: {e}")
+        return False
+
 def run():
     with sync_playwright() as p:
         browser = p.firefox.launch(headless=False)
         
-        # Verifica se já temos uma sessão salva
         if Path(STATE_FILE).exists():
             print("Carregando sessão existente...")
             context = browser.new_context(storage_state=STATE_FILE)
@@ -150,51 +266,35 @@ def run():
             context = browser.new_context()
 
         page = context.new_page()
-        print("Indo para o Teams...")
         page.goto("https://teams.microsoft.com")
 
-        # Aguarda a página carregar/redirecionar
         print("Aguardando carregamento (3 segundos)...")
         page.wait_for_timeout(3000)
 
-        # Se detectarmos que estamos na página de login
         if "login.microsoftonline.com" in page.url or "login.live.com" in page.url:
-            print(f"Página de login detectada: {page.url}")
             login(page)
             print("\n--- AÇÃO NECESSÁRIA ---")
-            print("Complete o 2FA e o login manualmente no navegador.")
-            print("Assim que estiver dentro do Teams, a sessão será salva automaticamente.")
-            
-            # Espera o usuário chegar no Teams (ou fechar o navegador)
+            print("Complete o 2FA manualmente.")
             try:
-                # Espera até que a URL seja do Teams (não seja login)
                 page.wait_for_url("https://teams.microsoft.com/**", timeout=300000)
-                
-                # Salva o estado para a próxima vez
+                page.wait_for_timeout(5000)
                 context.storage_state(path=STATE_FILE)
-                print(f"Sessão salva com sucesso em {STATE_FILE}!")
+                print(f"Sessão salva!")
             except Error:
-                print("Tempo esgotado ou navegador fechado antes de completar o login.")
-        elif "teams.microsoft.com" in page.url:
-            print("Já logado via sessão recuperada!")
-        else:
-            print(f"URL atual: {page.url}")
-
-        # Agora que estamos logados, buscamos as classes
+                print("Timeout no login.")
+        
         classes = get_classes(page)
         
         if classes:
-            print(f"\nTotal de classes encontradas: {len(classes)}")
-            # Entra na primeira classe da lista para testar a navegação
-            enter_class(page, classes[0])
-        else:
-            print("\nNenhuma classe encontrada ou erro no seletor.")
-
-        print("\nO script está ativo. Pressione Ctrl+C no terminal ou feche o navegador para encerrar.")
+            print(f"\nTotal: {len(classes)} classes.")
+            # Teste com a primeira classe
+            if enter_class(page, classes[0]):
+                if access_shared_files(page):
+                    list_and_download_files(page)
         
+        print("\nScript aguardando encerramento...")
         try:
-            # Mantém aberto para você interagir
-            page.wait_for_timeout(600000) # 10 minutos
+            page.wait_for_timeout(600000)
         except Error:
             print("Navegador fechado.")
 
