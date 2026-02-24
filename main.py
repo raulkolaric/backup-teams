@@ -62,6 +62,62 @@ def login(page):
         print(f"Aviso: Preenchimento automático falhou ou já estava logado: {e}")
         return False
 
+def get_classes(page):
+    print("\nBuscando suas classes/equipes...")
+    
+    try:
+        # Aguarda a seção de "Classes" (Educação) carregar
+        try:
+            page.wait_for_selector('[data-tid="ClassTeamsSection-panel"]', timeout=15000)
+        except:
+            print("Aviso: Seção 'ClassTeamsSection-panel' não encontrada. Tentando seletores genéricos.")
+
+        # O seletor mais confiável baseado no seu HTML para o nome da equipe
+        # <button data-testid="team-name">...<span class="fui-StyledText">NOME</span></button>
+        team_name_selector = '[data-testid="team-name"]'
+        
+        # Espera as cartas aparecerem
+        page.wait_for_selector(team_name_selector, timeout=10000)
+
+        # Rola para garantir o carregamento de todas
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(2000)
+
+        # Captura as cartas (fui-Card) para pegar o ID e o Nome
+        # O data-tid da fui-Card contém o ID da thread da equipe
+        cards = page.query_selector_all('.fui-Card')
+        
+        classes = []
+        print(f"Encontradas {len(cards)} cartas de equipe.")
+
+        for card in cards:
+            try:
+                # O nome está dentro de um botão com data-testid="team-name"
+                name_el = card.query_selector('[data-testid="team-name"]')
+                if not name_el:
+                    continue
+                
+                name = name_el.inner_text().strip()
+                
+                # O ID está no data-tid do card (ex: 19:xxx@thread.tacv2-team-card)
+                tid = card.get_attribute("data-tid") or ""
+                # Limpa o sufixo "-team-card" se existir para ter o ID puro
+                team_id = tid.replace("-team-card", "")
+
+                classes.append({
+                    "name": name,
+                    "id": team_id
+                })
+                print(f" - {name} (ID: {team_id})")
+            except Exception as e:
+                print(f"Erro ao processar card: {e}")
+
+        return classes
+
+    except Exception as e:
+        print(f"Erro ao buscar classes: {e}")
+        return []
+
 def run():
     with sync_playwright() as p:
         browser = p.firefox.launch(headless=False)
@@ -104,6 +160,14 @@ def run():
             print("Já logado via sessão recuperada!")
         else:
             print(f"URL atual: {page.url}")
+
+        # Agora que estamos logados, buscamos as classes
+        classes = get_classes(page)
+        
+        if classes:
+            print(f"\nTotal de classes encontradas: {len(classes)}")
+        else:
+            print("\nNenhuma classe encontrada ou erro no seletor.")
 
         print("\nO script está ativo. Pressione Ctrl+C no terminal ou feche o navegador para encerrar.")
         
