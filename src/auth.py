@@ -1,16 +1,21 @@
 """
 src/auth.py — Playwright-based login and Bearer token extraction.
 
-Strategy (Teams v2)
--------------------
-Teams v2 calls `authsvc/v1.0/authz` during startup. The RESPONSE body
-contains a JSON payload with access tokens for different Microsoft services.
-We intercept that response and pull out the token intended for
-graph.microsoft.com — that's the one we need for all our API calls.
+Strategy (Teams v2 / BFF architecture)
+---------------------------------------
+Teams v2 uses a Backend-for-Frontend pattern: the browser never calls
+graph.microsoft.com directly. It talks to teams.microsoft.com/api/... instead.
 
-Fallback: if the response body doesn't have a recognisable structure, we also
-watch for any direct request to graph.microsoft.com that carries a Bearer
-header (works for some tenant configurations).
+However, MSAL.js (the Microsoft auth library bundled in the Teams app) still
+caches tokens for all scopes—including Graph—in browser localStorage.
+
+We:
+  1. Log in (or resume saved session).
+  2. Wait for Teams to fully load.
+  3. Call page.evaluate() to read MSAL's localStorage token cache directly.
+  4. Return the first unexpired token whose target scope includes graph.microsoft.com.
+
+This works regardless of whether the page ever makes a direct Graph API call.
 """
 import json
 import os
@@ -18,87 +23,73 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from playwright.sync_api import sync_playwright, Page, BrowserContext, Response
+from playwright.sync_api import sync_playwright, Page, BrowserContext
 
 log = logging.getLogger("backup_teams.auth")
 
 STATE_FILE = "state.json"
 TEAMS_URL  = "https://teams.microsoft.com/v2/"
 
-# Authsvc endpoint that distributes tokens during Teams startup
-_AUTHSVC_URL = "authsvc/v1.0/authz"
 
-# Fallback: direct Graph API requests
-_GRAPH_DOMAIN = "graph.microsoft.com"
+# ─── MSAL localStorage extraction ─────────────────────────────────────────────
+
+_MSAL_JS = """
+() => {
+    /*
+     Read ALL localStorage entries and find one that:
+       - is a JSON object with a "secret" field (MSAL access token entry)
+       - "secret" starts with "ey" (JWT)
+       - "target" (scope string) mentions graph.microsoft.com
+       - is not expired  (expiresOn is a Unix timestamp in seconds)
+
+     MSAL key formats vary across versions:
+       <client_id>-login.windows.net-accesstoken-<...>-graph.microsoft.com-...
+       <many variants>
+     So we scan all keys, not just specific patterns.
+    */
+    const now = Math.floor(Date.now() / 1000);
+    const candidates = [];
+
+    for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        try {
+            const raw = localStorage.getItem(key);
+            if (!raw || raw.length < 100) continue;
+            const obj = JSON.parse(raw);
+            if (!obj || typeof obj !== 'object') continue;
+
+            const secret  = obj.secret  || obj.access_token || obj.token;
+            const target  = obj.target  || obj.scope        || obj.scopes || '';
+            const expires = obj.expiresOn || obj.expires_on || obj.ext_expires_on || 0;
+
+            if (!secret || typeof secret !== 'string' || !secret.startsWith('ey'))  continue;
+            if (!target || typeof target !== 'string') continue;
+            if (!target.toLowerCase().includes('graph')) continue;
+            if (expires && (parseInt(expires, 10) < now)) continue;  // expired
+
+            candidates.push({ token: secret, scope: target, expires: expires });
+        } catch(e) {}
+    }
+
+    // Return the candidate that expires latest (most valid)
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => (parseInt(b.expires) || 0) - (parseInt(a.expires) || 0));
+    return candidates[0].token;
+}
+"""
 
 
-# ─── Internal helpers ──────────────────────────────────────────────────────────
-
-def _extract_from_authsvc_body(body: bytes) -> Optional[str]:
-    """
-    Parse the authsvc response body and return the graph-scope access token.
-
-    Teams authsvc returns a JSON array of token objects, each with
-    an "application" key and a "token" key, e.g.:
-        [{"application": "graph", "token": "eyJ…"}, …]
-
-    Some tenants wrap this in {"tokens": […]}.
-    We also accept any "eyJ…" token whose audience claim ("aud") contains
-    "graph.microsoft.com" after base64 decoding the JWT payload.
-    """
+def _extract_token_from_storage(page) -> Optional[str]:
+    """Run MSAL cache extraction JS in the page context."""
     try:
-        data = json.loads(body)
-    except Exception:
+        token = page.evaluate(_MSAL_JS)
+        return token if isinstance(token, str) and token.startswith("ey") else None
+    except Exception as exc:
+        log.debug("localStorage extraction failed: %s", exc)
         return None
 
-    # Normalise to a flat list of candidate token objects
-    candidates = []
-    if isinstance(data, list):
-        candidates = data
-    elif isinstance(data, dict):
-        for key in ("tokens", "value", "accessTokens"):
-            if isinstance(data.get(key), list):
-                candidates = data[key]
-                break
 
-    if not candidates:
-        return None
-
-    # Priority 1 — explicit "graph" application tag
-    for item in candidates:
-        if isinstance(item, dict):
-            app = str(item.get("application", "")).lower()
-            token = item.get("token") or item.get("accessToken") or item.get("value")
-            if token and isinstance(token, str) and token.startswith("ey"):
-                if "graph" in app:
-                    return token
-
-    # Priority 2 — JWT whose payload "aud" claim targets graph
-    for item in candidates:
-        if isinstance(item, dict):
-            token = item.get("token") or item.get("accessToken") or item.get("value")
-            if token and isinstance(token, str) and token.startswith("ey"):
-                if _jwt_aud_is_graph(token):
-                    return token
-
-    return None
-
-
-def _jwt_aud_is_graph(token: str) -> bool:
-    """Decode the JWT payload (base64) and check if aud contains graph."""
-    import base64
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return False
-        # Add padding
-        payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
-        aud = payload.get("aud", "")
-        return "graph" in str(aud).lower()
-    except Exception:
-        return False
-
+# ─── Login helper ─────────────────────────────────────────────────────────────
 
 def _do_login(page: Page) -> bool:
     """Fill in credentials on the Microsoft login page."""
@@ -107,31 +98,24 @@ def _do_login(page: Page) -> bool:
     if not email or not password:
         log.error("EMAIL / PASSWORD not set in .env — cannot auto-login.")
         return False
-
     try:
         page.wait_for_selector('input[type="email"]', timeout=30_000)
         page.fill('input[type="email"]', email)
         page.click("#idSIButton9")
-
         page.wait_for_selector('input[type="password"]', timeout=30_000)
         page.fill('input[type="password"]', password)
         page.wait_for_timeout(1_200)
         page.click("#idSIButton9")
-
-        # "Stay signed in?" prompt
         try:
             page.click("#idSIButton9", timeout=6_000)
         except Exception:
             pass
-
-        # Prefer web app over desktop client
         try:
             page.locator(
                 'text=/Use (o aplicativo Web|the web app) em vez disso|instead/i'
             ).click(timeout=10_000)
         except Exception:
             pass
-
         return True
     except Exception as exc:
         log.warning("Auto-login failed: %s", exc)
@@ -142,13 +126,11 @@ def _do_login(page: Page) -> bool:
 
 def get_bearer_token() -> str:
     """
-    Launch Chromium, log in (or resume session), capture the Graph API token
-    from the authsvc response body, close the browser, return the token.
+    Launch Chromium, wait for Teams to load, extract a Graph API access token
+    from MSAL's localStorage cache, close the browser, and return the token.
 
-    Raises RuntimeError if no token is captured within the timeout.
+    Raises RuntimeError if no token is found within the timeout.
     """
-    captured: list = []
-
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
 
@@ -160,38 +142,6 @@ def get_bearer_token() -> str:
             context = browser.new_context()
 
         page = context.new_page()
-
-        # ── Strategy 1: intercept authsvc RESPONSE body ───────────────────────
-        def on_response(response: Response):
-            if captured:
-                return
-            if _AUTHSVC_URL not in response.url:
-                return
-            try:
-                body = response.body()
-                token = _extract_from_authsvc_body(body)
-                if token:
-                    log.info("Graph token extracted from authsvc response ✓")
-                    captured.append(token)
-                else:
-                    log.debug("authsvc response didn't contain a graph token (trying fallback)")
-            except Exception as exc:
-                log.debug("Could not read authsvc response: %s", exc)
-
-        # ── Strategy 2 (fallback): direct Graph API request header ────────────
-        def on_request(request):
-            if captured:
-                return
-            if _GRAPH_DOMAIN not in request.url:
-                return
-            auth = request.headers.get("authorization", "")
-            if auth.startswith("Bearer ey"):
-                token = auth[len("Bearer "):]
-                log.info("Graph token captured from direct Graph request ✓")
-                captured.append(token)
-
-        page.on("response", on_response)
-        page.on("request",  on_request)
 
         log.info("Navigating to Teams…")
         page.goto(TEAMS_URL)
@@ -206,27 +156,32 @@ def get_bearer_token() -> str:
             page.wait_for_url(f"{base}/**", timeout=300_000)
             page.wait_for_timeout(5_000)
 
-        # Wait up to 30 s — authsvc fires automatically on Teams startup
-        log.info("Teams loaded — waiting for Graph token from authsvc (up to 30s)…")
-        for i in range(30):
-            if captured:
-                break
-            page.wait_for_timeout(1_000)
-            if i == 15 and not captured:
-                log.info("Still waiting — soft-reloading page to re-trigger authsvc…")
-                try:
-                    page.reload(wait_until="domcontentloaded", timeout=15_000)
-                except Exception:
-                    pass
+        # Wait for Teams to fully populate its MSAL cache (network activity settles)
+        log.info("Teams loaded — waiting for MSAL cache to populate…")
+        page.wait_for_load_state("networkidle", timeout=30_000)
+        page.wait_for_timeout(2_000)
 
+        # Extract Graph token from MSAL localStorage
+        token = _extract_token_from_storage(page)
+
+        if not token:
+            # One more attempt after a brief extra wait
+            log.info("Token not found yet — waiting 5 more seconds…")
+            page.wait_for_timeout(5_000)
+            token = _extract_token_from_storage(page)
+
+        # Persist session
         context.storage_state(path=STATE_FILE)
         log.info("Session saved to %s", STATE_FILE)
         browser.close()
 
-    if not captured:
+    if not token:
         raise RuntimeError(
-            "Could not capture a Graph API Bearer token.\n"
-            "Try deleting state.json, run again, and complete login manually."
+            "Could not find a Graph API token in MSAL localStorage cache.\n"
+            "This usually means MSAL hasn't requested a Graph token yet.\n"
+            "Try: delete state.json and re-run to force a fresh login, which "
+            "triggers MSAL to fetch tokens for all configured scopes."
         )
 
-    return captured[0]
+    log.info("Graph API token extracted from MSAL cache ✓")
+    return token
