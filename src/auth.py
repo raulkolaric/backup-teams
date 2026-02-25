@@ -132,7 +132,7 @@ def get_bearer_token() -> str:
     Raises RuntimeError if no token is found within the timeout.
     """
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=True)
 
         if Path(STATE_FILE).exists():
             log.info("Resuming saved browser session from %s", STATE_FILE)
