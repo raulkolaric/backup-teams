@@ -149,18 +149,33 @@ async def _download_with_semaphore(
     stats: ScrapingStats,
     **kwargs,
 ) -> None:
+    item      = kwargs.get("item", {})
+    item_id   = item["id"]
+    etag      = item.get("eTag", item.get("id"))
+    file_name = item.get("name", "unknown")
+
+    # ── Etag check BEFORE semaphore ───────────────────────────────────────────
+    # is_file_current is a cheap DB read — no reason to rate-limit it.
+    # Running all etag checks in parallel means 1000+ skip decisions happen
+    # concurrently; only files that actually need downloading enter the queue.
+    if await db_mod.is_file_current(pool, item_id, etag):
+        log.info("[SKIP] %s (etag matches — already in S3)", file_name)
+        stats.files_skipped += 1
+        return
+
+    # ── Actual download+upload is rate-limited by semaphore ──────────────────
     async with semaphore:
         try:
             result = await downloader.download_item(graph, pool, **kwargs)
             if result == "ok":
                 stats.files_new += 1
             elif result == "skip":
+                # download_item did its own etag check (race condition safe)
                 stats.files_skipped += 1
             else:
                 stats.files_error += 1
         except Exception as exc:
-            item_name = kwargs.get("item", {}).get("name", "unknown")
-            log.error("Failed to download %s: %s", item_name, exc)
+            log.error("Failed to download %s: %s", file_name, exc)
             stats.files_error += 1
 
 
