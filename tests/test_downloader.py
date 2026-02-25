@@ -1,18 +1,16 @@
 """
-tests/test_downloader.py — Unit tests for the skip/download/conflict logic
-including the S3 upload step introduced in Phase B.
+tests/test_downloader.py — Unit tests for S3-direct pipeline.
 
-All external I/O (DB pool, Graph API, S3, filesystem) is mocked so these
-tests run in-memory with zero network/database/AWS dependencies.
+S3-direct mode: files go Graph API → S3, never touching local disk.
+local_path is passed in for key derivation only but never written to.
 
 Test matrix:
-  1. test_skip_when_etag_matches       — same eTag in DB  → nothing called
-  2. test_download_when_new            — file not in DB   → downloaded, S3 upload, DB record
-  3. test_conflict_renames_old_file    — eTag changed     → backup rename, new download, S3 upload
-  4. test_s3_failure_is_nonfatal       — S3 upload throws → local file kept, DB record still written
-  5. test_skip_s3_when_bucket_not_set  — S3_BUCKET=""     → storage.upload_file never called
+  1. test_skip_when_etag_matches    — etag in DB matches → nothing called
+  2. test_download_and_upload       — new file → downloaded, S3 upload, DB record (local_path=None)
+  3. test_s3_failure_aborts_db      — S3 upload throws → DB record NOT written (no dangling record)
+  4. test_no_bucket_aborts          — S3_BUCKET="" → no DB record written
+  5. test_etag_changed_overwrites   — etag differs → re-downloaded, S3 overwritten, DB updated
 """
-import asyncio
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -39,32 +37,25 @@ def _make_graph(file_bytes: bytes = FILE_BYTES) -> MagicMock:
     return graph
 
 
-def _make_pool() -> MagicMock:
-    return MagicMock()
-
-
-# ── Test 1: Skip when eTag matches ────────────────────────────────────────────
+# ── Test 1: Skip when etag matches ────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_skip_when_etag_matches(tmp_path: Path):
-    """Same eTag in DB → zero calls to Graph or S3."""
+    """Same etag in DB → no Graph call, no S3 call."""
     from src import downloader
 
     graph = _make_graph()
-    pool  = _make_pool()
+    pool  = MagicMock()
 
     with (
-        patch("src.downloader.db_mod.is_file_current",  new=AsyncMock(return_value=True)),
-        patch("src.downloader.db_mod.get_archive_etag", new=AsyncMock(return_value=ETAG)),
-        patch("src.downloader.db_mod.upsert_archive",   new=AsyncMock()) as mock_upsert,
+        patch("src.downloader.db_mod.is_file_current", new=AsyncMock(return_value=True)),
+        patch("src.downloader.db_mod.upsert_archive",  new=AsyncMock()) as mock_upsert,
         patch("src.downloader.storage.upload_file") as mock_s3,
     ):
         await downloader.download_item(
             graph, pool,
-            drive_id=DRIVE_ID,
-            item=_make_item(ETAG),
-            class_id=None,
-            local_path=tmp_path / FILE_NAME,
+            drive_id=DRIVE_ID, item=_make_item(ETAG),
+            class_id=None, local_path=tmp_path / FILE_NAME,
         )
 
     graph.download_file.assert_not_called()
@@ -72,136 +63,104 @@ async def test_skip_when_etag_matches(tmp_path: Path):
     mock_upsert.assert_not_called()
 
 
-# ── Test 2: Download and upload when brand-new ────────────────────────────────
+# ── Test 2: New file — download, upload, persist ──────────────────────────────
 
 @pytest.mark.asyncio
-async def test_download_when_new(tmp_path: Path):
-    """File not in DB → downloaded, uploaded to S3, DB record created."""
+async def test_download_and_upload(tmp_path: Path):
+    """New file → downloaded, uploaded to S3, DB record with local_path=None."""
     from src import downloader
 
-    graph      = _make_graph()
-    pool       = _make_pool()
     local_path = tmp_path / FILE_NAME
 
     with (
-        patch("src.downloader.db_mod.is_file_current",  new=AsyncMock(return_value=False)),
-        patch("src.downloader.db_mod.get_archive_etag", new=AsyncMock(return_value=None)),
-        patch("src.downloader.db_mod.upsert_archive",   new=AsyncMock()) as mock_upsert,
-        patch("src.downloader.storage.upload_file", return_value=S3_KEY) as mock_s3,
-        patch.dict(os.environ, {"S3_BUCKET": S3_BUCKET}),
-    ):
-        # Reset the cached bucket value so the env patch takes effect
-        downloader._S3_BUCKET = S3_BUCKET
-        await downloader.download_item(
-            graph, pool,
-            drive_id=DRIVE_ID,
-            item=_make_item(ETAG),
-            class_id=None,
-            local_path=local_path,
-        )
-
-    graph.download_file.assert_called_once_with(DRIVE_ID, ITEM_ID)
-    assert local_path.read_bytes() == FILE_BYTES
-    mock_s3.assert_called_once_with(S3_BUCKET, mock_s3.call_args[0][1], FILE_BYTES)
-    mock_upsert.assert_called_once()
-    _, kwargs = mock_upsert.call_args
-    assert kwargs["s3_key"] == S3_KEY
-
-
-# ── Test 3: Conflict — eTag changed, rename old file ─────────────────────────
-
-@pytest.mark.asyncio
-async def test_conflict_renames_old_file(tmp_path: Path):
-    """eTag changed → old file renamed to _backup_*, new version downloaded and uploaded."""
-    from src import downloader
-
-    graph      = _make_graph()
-    pool       = _make_pool()
-    local_path = tmp_path / FILE_NAME
-    local_path.write_bytes(b"old PDF content")
-
-    with (
-        patch("src.downloader.db_mod.is_file_current",  new=AsyncMock(return_value=False)),
-        patch("src.downloader.db_mod.get_archive_etag", new=AsyncMock(return_value=ETAG)),
-        patch("src.downloader.db_mod.upsert_archive",   new=AsyncMock()),
+        patch("src.downloader.db_mod.is_file_current", new=AsyncMock(return_value=False)),
+        patch("src.downloader.db_mod.upsert_archive",  new=AsyncMock()) as mock_upsert,
         patch("src.downloader.storage.upload_file", return_value=S3_KEY),
         patch.dict(os.environ, {"S3_BUCKET": S3_BUCKET}),
     ):
         downloader._S3_BUCKET = S3_BUCKET
         await downloader.download_item(
-            graph, pool,
-            drive_id=DRIVE_ID,
-            item=_make_item(NEW_ETAG),
-            class_id=None,
-            local_path=local_path,
+            _make_graph(), MagicMock(),
+            drive_id=DRIVE_ID, item=_make_item(ETAG),
+            class_id=None, local_path=local_path,
         )
 
-    assert local_path.read_bytes() == FILE_BYTES
-    backups = [f for f in tmp_path.iterdir() if f.name != FILE_NAME and "backup" in f.name]
-    assert len(backups) == 1
-    assert backups[0].read_bytes() == b"old PDF content"
+    # File must NOT be written to disk
+    assert not local_path.exists(), "S3-direct mode must not write to disk"
+
+    mock_upsert.assert_called_once()
+    _, kwargs = mock_upsert.call_args
+    assert kwargs["s3_key"] == S3_KEY
+    assert kwargs["local_path"] is None
 
 
-# ── Test 4: S3 upload failure is non-fatal ────────────────────────────────────
+# ── Test 3: S3 failure → no DB record ────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_s3_failure_is_nonfatal(tmp_path: Path):
-    """S3 upload throws → local file is kept, DB record is still written with s3_key=None."""
+async def test_s3_failure_aborts_db(tmp_path: Path):
+    """S3 upload fails → DB record is NOT written. No dangling record without a file."""
     from src import downloader
 
-    graph      = _make_graph()
-    pool       = _make_pool()
-    local_path = tmp_path / FILE_NAME
-
     with (
-        patch("src.downloader.db_mod.is_file_current",  new=AsyncMock(return_value=False)),
-        patch("src.downloader.db_mod.get_archive_etag", new=AsyncMock(return_value=None)),
-        patch("src.downloader.db_mod.upsert_archive",   new=AsyncMock()) as mock_upsert,
+        patch("src.downloader.db_mod.is_file_current", new=AsyncMock(return_value=False)),
+        patch("src.downloader.db_mod.upsert_archive",  new=AsyncMock()) as mock_upsert,
         patch("src.downloader.storage.upload_file", side_effect=Exception("AWS error")),
         patch.dict(os.environ, {"S3_BUCKET": S3_BUCKET}),
     ):
         downloader._S3_BUCKET = S3_BUCKET
         await downloader.download_item(
-            graph, pool,
-            drive_id=DRIVE_ID,
-            item=_make_item(ETAG),
-            class_id=None,
-            local_path=local_path,
+            _make_graph(), MagicMock(),
+            drive_id=DRIVE_ID, item=_make_item(ETAG),
+            class_id=None, local_path=tmp_path / FILE_NAME,
         )
 
-    assert local_path.read_bytes() == FILE_BYTES   # local copy preserved
-    mock_upsert.assert_called_once()
-    _, kwargs = mock_upsert.call_args
-    assert kwargs["s3_key"] is None                # recorded without S3 key
+    mock_upsert.assert_not_called()
 
 
-# ── Test 5: S3 skipped when bucket not configured ────────────────────────────
+# ── Test 4: No bucket → no DB record ─────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_skip_s3_when_bucket_not_set(tmp_path: Path):
-    """S3_BUCKET="" → storage.upload_file never called, DB record written without s3_key."""
+async def test_no_bucket_aborts(tmp_path: Path):
+    """S3_BUCKET not configured → download happens but nothing is persisted."""
     from src import downloader
 
-    graph      = _make_graph()
-    pool       = _make_pool()
-    local_path = tmp_path / FILE_NAME
-
     with (
-        patch("src.downloader.db_mod.is_file_current",  new=AsyncMock(return_value=False)),
-        patch("src.downloader.db_mod.get_archive_etag", new=AsyncMock(return_value=None)),
-        patch("src.downloader.db_mod.upsert_archive",   new=AsyncMock()) as mock_upsert,
+        patch("src.downloader.db_mod.is_file_current", new=AsyncMock(return_value=False)),
+        patch("src.downloader.db_mod.upsert_archive",  new=AsyncMock()) as mock_upsert,
         patch("src.downloader.storage.upload_file") as mock_s3,
     ):
-        downloader._S3_BUCKET = ""   # simulate unconfigured
+        downloader._S3_BUCKET = ""
         await downloader.download_item(
-            graph, pool,
-            drive_id=DRIVE_ID,
-            item=_make_item(ETAG),
-            class_id=None,
-            local_path=local_path,
+            _make_graph(), MagicMock(),
+            drive_id=DRIVE_ID, item=_make_item(ETAG),
+            class_id=None, local_path=tmp_path / FILE_NAME,
         )
 
     mock_s3.assert_not_called()
+    mock_upsert.assert_not_called()
+
+
+# ── Test 5: etag changed → re-upload overwrites S3 ───────────────────────────
+
+@pytest.mark.asyncio
+async def test_etag_changed_overwrites(tmp_path: Path):
+    """etag changed → re-downloaded, S3 overwritten with new bytes, DB updated."""
+    from src import downloader
+
+    with (
+        patch("src.downloader.db_mod.is_file_current", new=AsyncMock(return_value=False)),
+        patch("src.downloader.db_mod.upsert_archive",  new=AsyncMock()) as mock_upsert,
+        patch("src.downloader.storage.upload_file", return_value=S3_KEY) as mock_s3,
+        patch.dict(os.environ, {"S3_BUCKET": S3_BUCKET}),
+    ):
+        downloader._S3_BUCKET = S3_BUCKET
+        await downloader.download_item(
+            _make_graph(), MagicMock(),
+            drive_id=DRIVE_ID, item=_make_item(NEW_ETAG),
+            class_id=None, local_path=tmp_path / FILE_NAME,
+        )
+
+    mock_s3.assert_called_once()
     mock_upsert.assert_called_once()
     _, kwargs = mock_upsert.call_args
-    assert kwargs["s3_key"] is None
+    assert kwargs["etag"] == NEW_ETAG

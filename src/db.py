@@ -5,8 +5,8 @@ Design:
   - One pool is created at startup and reused for the entire run.
   - All public functions accept the pool as first argument (dependency
     injection → easy to test / mock).
-  - Schema is applied on first connection via db/schema.sql so the tool
-    is self-bootstrapping (no manual psql step needed).
+  - Schema is managed entirely by Alembic. Run `alembic upgrade head`
+    before the first run against a new database.
 """
 import os
 import logging
@@ -18,15 +18,14 @@ import asyncpg
 
 log = logging.getLogger("backup_teams.db")
 
-_SCHEMA_PATH = Path(__file__).parent.parent / "db" / "schema.sql"
-
 
 # ─── Pool lifecycle ────────────────────────────────────────────────────────────
 
 async def init_pool() -> asyncpg.Pool:
     """
-    Create a connection pool and apply the schema (idempotent).
+    Create an asyncpg connection pool.
     Reads DB_* variables from the environment.
+    Schema must already be applied via `alembic upgrade head`.
     """
     dsn = (
         f"postgresql://{os.environ['DB_USER']}"
@@ -35,13 +34,7 @@ async def init_pool() -> asyncpg.Pool:
         f"/{os.environ['DB_NAME']}"
     )
     pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
-
-    # Apply schema (CREATE TABLE IF NOT EXISTS — safe to run every time)
-    schema_sql = _SCHEMA_PATH.read_text()
-    async with pool.acquire() as conn:
-        await conn.execute(schema_sql)
-
-    log.info("Database pool initialised and schema applied.")
+    log.info("Database pool initialised.")
     return pool
 
 
