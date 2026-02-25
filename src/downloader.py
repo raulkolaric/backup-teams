@@ -8,14 +8,11 @@ Flow (S3-direct mode, no local disk writes)
 3. Upload bytes directly to S3.
 4. Write the s3_key to the archive table (local_path = NULL).
 
-The local_path column is kept nullable in the schema for backward
-compatibility (migration 002), but is always NULL in S3-direct mode.
-
-Conflict resolution (when etag changes)
------------------------------------------
-The old S3 object is NOT deleted — S3 is cheap and the history is useful.
-Instead, a new version is uploaded under the same key (S3 overwrites it).
-The DB record is updated with the new etag.
+Returns
+-------
+"skip"  — file was already current in S3 and DB, nothing done
+"ok"    — file was downloaded and uploaded to S3 successfully
+"error" — something failed (logged); no DB record written
 
 S3 Key Scheme
 -------------
@@ -47,10 +44,6 @@ def _build_s3_key(local_path: Path) -> str:
 
     The local path is never written to — it is used only as a structured
     reference to carry team/channel/filename information from the scraper.
-
-    Example:
-      local_path = ./downloads/Calculus/General/notes.pdf
-      → s3_key   = backup_teams/Calculus/General/notes.pdf
     """
     download_root = Path(os.environ.get("DOWNLOAD_ROOT", "./downloads")).resolve()
     try:
@@ -68,22 +61,22 @@ async def download_item(
     item: dict,
     class_id: UUID,
     local_path: Path,
-) -> None:
+) -> str:
     """
     Download a file from the Graph API and store it in S3.
 
-    local_path is used ONLY for S3 key derivation — the file is never
-    written to the local filesystem.
+    Returns "skip", "ok", or "error".
+    local_path is used ONLY for S3 key derivation, never written to.
     """
     item_id   = item["id"]
     etag      = item.get("eTag", item.get("id"))
     file_name = item["name"]
     extension = Path(file_name).suffix.lstrip(".").lower() or "bin"
 
-    # ── Step 1: Skip if up-to-date (etag match in DB) ─────────────────────────
+    # ── Step 1: Skip if up-to-date ────────────────────────────────────────────
     if await db_mod.is_file_current(pool, item_id, etag):
         log.info("[SKIP] %s (etag matches — already in S3)", file_name)
-        return
+        return "skip"
 
     # ── Step 2: Download bytes from Graph API ─────────────────────────────────
     log.info("[DL] %s …", file_name)
@@ -101,20 +94,20 @@ async def download_item(
             log.info("[S3] %-50s → s3://%s/%s", file_name, _S3_BUCKET, s3_key)
         except Exception as exc:
             log.warning("[S3] Upload failed for %s: %s", file_name, exc)
-            # Don't persist to DB if S3 failed — we have no durable copy
-            return
+            return "error"
     else:
         log.warning("[S3] S3_BUCKET not configured — file %s not stored", file_name)
-        return
+        return "error"
 
-    # ── Step 4: Persist record to DB (local_path = NULL) ─────────────────────
+    # ── Step 4: Persist record to DB ──────────────────────────────────────────
     await db_mod.upsert_archive(
         pool,
         class_id=class_id,
         file_name=file_name,
         file_extension=extension,
-        local_path=None,        # S3-direct mode: no local copy
+        local_path=None,
         drive_item_id=item_id,
         etag=etag,
         s3_key=s3_key,
     )
+    return "ok"

@@ -82,6 +82,19 @@ class GraphClient:
                     response=resp,
                 )
 
+            if resp.status_code == 403:
+                # Log the full error body — Microsoft includes an error code and
+                # message that explains exactly why access was denied.
+                try:
+                    body = resp.json()
+                    err  = body.get("error", {})
+                    log.debug(
+                        "403 body for %s: code=%r message=%r",
+                        url, err.get("code"), err.get("message"),
+                    )
+                except Exception:
+                    pass
+
             resp.raise_for_status()
             return resp.json()
 
@@ -108,6 +121,17 @@ class GraphClient:
     async def list_channels(self, team_id: str) -> List[dict]:
         """Return all channels for the given team."""
         return await self._get_all(f"/teams/{team_id}/channels")
+
+    async def get_primary_channel(self, team_id: str) -> dict:
+        """
+        Return the primary (General) channel for a team.
+
+        Used as a fallback when /teams/{id}/channels returns 403 —
+        which happens in Education tenants where the channels list
+        endpoint is restricted for student-role members even when they
+        can see the team. The primary channel is always accessible.
+        """
+        return await self._get(f"/teams/{team_id}/primaryChannel")
 
     async def get_files_folder(self, team_id: str, channel_id: str) -> dict:
         """

@@ -29,10 +29,11 @@ async def _async_main(token: str) -> None:
 
     log.info("Step 3/3 — Starting scrape across all teams…")
     async with GraphClient(token) as graph:
-        await scrape_all(graph, pool)
+        stats = await scrape_all(graph, pool)
 
     await pool.close()
-    log.info("Done. All files are in your downloads folder.")
+    log.info(stats.report())
+
 
 
 def main() -> None:
