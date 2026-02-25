@@ -5,15 +5,15 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_DB:       ${DB_NAME}
-      POSTGRES_USER:     ${DB_USER}
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
-      - pgdata:/var/lib/postgresql/data   # data survives container restarts
+      - pgdata:/var/lib/postgresql/data # data survives container restarts
     ports:
-      - "5432:5432"   # expose for local psql / DB GUI access
+      - "5433:5432" # 5433 on host → avoids clash with native Mac Postgres on 5432
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}" ]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -25,19 +25,19 @@ services:
       db:
         condition: service_healthy
     environment:
-      DB_HOST:               db           # service name → internal Docker hostname
-      DB_PORT:               5432
-      DB_NAME:               ${DB_NAME}
-      DB_USER:               ${DB_USER}
-      DB_PASSWORD:           ${DB_PASSWORD}
-      EMAIL:                 ${EMAIL}
-      PASSWORD:              ${PASSWORD}
-      DOWNLOAD_ROOT:         /data/downloads   # container-internal, matches volume
-      DOWNLOAD_CONCURRENCY:  ${DOWNLOAD_CONCURRENCY:-4}
-      DEFAULT_SEMESTER:      ${DEFAULT_SEMESTER:-2025/1}
-      DEFAULT_YEAR:          ${DEFAULT_YEAR:-2025}
+      DB_HOST: db # service name → internal Docker hostname
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      EMAIL: ${EMAIL}
+      PASSWORD: ${PASSWORD}
+      DOWNLOAD_ROOT: /data/downloads # container-internal, matches volume
+      DOWNLOAD_CONCURRENCY: ${DOWNLOAD_CONCURRENCY:-4}
+      DEFAULT_SEMESTER: ${DEFAULT_SEMESTER:-2025/1}
+      DEFAULT_YEAR: ${DEFAULT_YEAR:-2025}
     volumes:
-      - ./downloads:/data/downloads       # host folder ↔ container path
+      - ./downloads:/data/downloads # host folder ↔ container path
     # The scraper needs a display for Playwright (headless=False for auth).
     # On a headless server, set the CHROME_* env vars and switch to headless=True
     # in src/auth.py, or pre-run the auth step locally and copy state.json in.

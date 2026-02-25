@@ -4,3 +4,12 @@ asyncpg
 python-dotenv
 rich
 tqdm
+
+# ── Migrations ─────────────────────────────────────────────────────────────────
+alembic==1.16.5
+sqlalchemy
+psycopg2-binary
+
+# ── API ────────────────────────────────────────────────────────────────────────
+fastapi==0.128.8
+uvicorn[standard]
