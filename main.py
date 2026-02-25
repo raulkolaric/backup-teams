@@ -22,14 +22,20 @@ from src.teams_scraper import scrape_all
 log = logging.getLogger("backup_teams")
 
 
+from src.indexer import run_incremental
+
 async def _async_main(token: str) -> None:
     """Everything that runs inside the asyncio event loop."""
-    log.info("Step 2/3 — Connecting to PostgreSQL…")
+    log.info("Step 2/4 — Connecting to PostgreSQL…")
     pool = await init_pool()
 
-    log.info("Step 3/3 — Starting scrape across all teams…")
+    log.info("Step 3/4 — Starting scrape across all teams…")
     async with GraphClient(token) as graph:
         stats = await scrape_all(graph, pool)
+
+    log.info("Step 4/4 — Indexing new PDFs for full-text search…")
+    indexed_count = await run_incremental(pool)
+    log.info("Indexed %d new PDFs.", indexed_count)
 
     await pool.close()
     log.info(stats.report())

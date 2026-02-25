@@ -35,9 +35,13 @@ from src.utils import build_local_path, get_download_root, sanitize
 
 log = logging.getLogger("backup_teams.scraper")
 
-DOWNLOAD_CONCURRENCY  = int(os.getenv("DOWNLOAD_CONCURRENCY", "4"))
-MAX_CHANNEL_RETRIES   = 0
-CHANNEL_RETRY_DELAY   = 5
+DOWNLOAD_CONCURRENCY      = int(os.getenv("DOWNLOAD_CONCURRENCY", "4"))
+MAX_CHANNEL_RETRIES       = 0
+CHANNEL_RETRY_DELAY       = 5
+# Seconds to wait before retrying an empty root folder.
+# SharePoint's content DB sometimes returns 0 items on the first call
+# to a newly-accessed or newly-provisioned site, then populates on retry.
+SHAREPOINT_WARM_UP_DELAY  = 3
 
 
 # ─── Stats ─────────────────────────────────────────────────────────────────────
@@ -103,12 +107,25 @@ async def _walk_folder(
     item_id: str,
     class_id: UUID,
     local_base: Path,
+    is_root: bool = False,
 ) -> None:
     try:
         children = await graph.list_drive_children(drive_id, item_id)
     except Exception as exc:
         log.error("Failed to list folder contents (item %s): %s", item_id, exc)
         return
+
+    # SharePoint cache warming: the first API call to a newly-accessed site
+    # sometimes returns 0 items even though files exist. A short wait + retry
+    # triggers SharePoint to hydrate its content cache.
+    if is_root and not children:
+        log.debug("[DRIVES] Root folder empty on first call — warming up, retrying in %ds", SHAREPOINT_WARM_UP_DELAY)
+        await asyncio.sleep(SHAREPOINT_WARM_UP_DELAY)
+        try:
+            children = await graph.list_drive_children(drive_id, item_id)
+        except Exception as exc:
+            log.error("Failed to list folder contents on retry (item %s): %s", item_id, exc)
+            return
 
     tasks = []
     for child in children:
@@ -305,12 +322,16 @@ async def _process_site_drives(
     professor_id: Optional[UUID],
     download_root: str,
     known_site_id: Optional[str] = None,
+    channels_accessible: bool = True,
 ) -> None:
     """
-    Walk all non-default SharePoint document libraries for a team's site.
+    Walk all SharePoint document libraries for a team's site.
 
-    Uses known_site_id (from filesFolder) when available — avoids the broken
-    /teams/{id}/drive path. Falls back to /groups/{id}/drive if needed.
+    channels_accessible controls which libraries we skip:
+    - True  → skip default 'Documentos'/'Documents' libraries because the
+              channel walk already covered them via filesFolder.
+    - False → do NOT skip default libraries — channels were denied (403) so
+              nothing else will walk 'Documentos', and that's where the files are.
     """
     site_id = await _get_site_id_for_team(
         graph, team_id, team_name, known_site_id
@@ -328,7 +349,10 @@ async def _process_site_drives(
         drive_name = drive.get("name", "unknown")
         drive_id   = drive["id"]
 
-        if drive_name.lower() in _DEFAULT_LIBRARY_NAMES:
+        if drive_name.lower() in _DEFAULT_LIBRARY_NAMES and channels_accessible:
+            # Skip only when channels were accessible — channels already walked
+            # the default library via filesFolder. If channels were denied,
+            # we must walk it here since nothing else will.
             continue
 
         log.info("[DRIVES] %s — walking library %r", team_name, drive_name)
@@ -357,7 +381,9 @@ async def _process_site_drives(
             item_id=root["id"],
             class_id=class_id,
             local_base=local_base,
+            is_root=True,   # retry once if empty (SharePoint cache warming)
         )
+
 
 
 # ─── Channel processing ────────────────────────────────────────────────────────
@@ -479,6 +505,7 @@ async def _process_team(
         professor_id=professor_id,
         download_root=download_root,
         known_site_id=known_site_id,
+        channels_accessible=(channels is not None),
     )
 
 
