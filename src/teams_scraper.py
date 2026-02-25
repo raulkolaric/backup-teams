@@ -36,7 +36,7 @@ from src.utils import build_local_path, get_download_root, sanitize
 log = logging.getLogger("backup_teams.scraper")
 
 DOWNLOAD_CONCURRENCY  = int(os.getenv("DOWNLOAD_CONCURRENCY", "4"))
-MAX_CHANNEL_RETRIES   = 2
+MAX_CHANNEL_RETRIES   = 0
 CHANNEL_RETRY_DELAY   = 5
 
 
@@ -411,68 +411,88 @@ async def _process_channel(
 
 # ─── Public entry point ────────────────────────────────────────────────────────
 
+async def _process_team(
+    graph: GraphClient,
+    pool: asyncpg.Pool,
+    semaphore: asyncio.Semaphore,
+    stats: ScrapingStats,
+    team: dict,
+    download_root: str,
+) -> None:
+    """Process a single team: channels + site drives. Called concurrently."""
+    team_id   = team["id"]
+    team_name = team.get("displayName", "unknown-team")
+
+    log.info("Team: %s", team_name)
+    stats.teams_total += 1
+
+    curso_id     = await db_mod.upsert_curso(pool, name=team_name, teams_id=team_id)
+    professor_id = await _resolve_professor(graph, pool, team_id)
+
+    # ── Channel pass ─────────────────────────────────────────────────────────
+    channels = await _get_channels_with_fallback(graph, team_id, team_name, stats)
+
+    known_site_id: Optional[str] = None
+
+    if channels is not None:
+        channel_results = await asyncio.gather(
+            *[
+                _process_channel(
+                    graph, pool, semaphore, stats,
+                    team_id=team_id,
+                    channel=ch,
+                    curso_id=curso_id,
+                    professor_id=professor_id,
+                    download_root=download_root,
+                    curso_name=team_name,
+                )
+                for ch in channels
+            ],
+            return_exceptions=True,
+        )
+        for result in channel_results:
+            if isinstance(result, str) and result:
+                known_site_id = result
+                break
+
+    # ── Site drives pass ──────────────────────────────────────────────────────
+    await _process_site_drives(
+        graph, pool, semaphore, stats,
+        team_id=team_id,
+        team_name=team_name,
+        curso_id=curso_id,
+        professor_id=professor_id,
+        download_root=download_root,
+        known_site_id=known_site_id,
+    )
+
+
 async def scrape_all(
     graph: GraphClient,
     pool: asyncpg.Pool,
 ) -> ScrapingStats:
+    """
+    Main orchestration loop — all teams processed concurrently.
+
+    The download semaphore (DOWNLOAD_CONCURRENCY) controls actual file I/O.
+    Team-level API calls (channel listing, drives, filesFolder) run in
+    parallel across all teams, eliminating idle wait time between them.
+    """
     download_root = get_download_root()
     semaphore     = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
     stats         = ScrapingStats()
 
     log.info("Fetching joined teams…")
     teams = await graph.list_joined_teams()
-    log.info("Found %d teams.", len(teams))
+    log.info("Found %d teams — processing concurrently.", len(teams))
 
-    for team in teams:
-        team_id   = team["id"]
-        team_name = team.get("displayName", "unknown-team")
-        log.info("Team: %s", team_name)
-        stats.teams_total += 1
-
-        curso_id     = await db_mod.upsert_curso(pool, name=team_name, teams_id=team_id)
-        professor_id = await _resolve_professor(graph, pool, team_id)
-
-        # ── Channel pass ─────────────────────────────────────────────────────
-        channels = await _get_channels_with_fallback(graph, team_id, team_name, stats)
-
-        known_site_id: Optional[str] = None
-
-        if channels is not None:
-            # Process channels concurrently; collect siteId from any that succeed
-            channel_results = await asyncio.gather(
-                *[
-                    _process_channel(
-                        graph, pool, semaphore, stats,
-                        team_id=team_id,
-                        channel=ch,
-                        curso_id=curso_id,
-                        professor_id=professor_id,
-                        download_root=download_root,
-                        curso_name=team_name,
-                    )
-                    for ch in channels
-                ],
-                return_exceptions=True,
-            )
-            # Take the first non-None siteId returned by any channel
-            for result in channel_results:
-                if isinstance(result, str) and result:
-                    known_site_id = result
-                    break
-
-        # ── Site drives pass ─────────────────────────────────────────────────
-        # Always run — uses known_site_id from filesFolder when available,
-        # falls back to /groups/{id}/drive for denied teams.
-        # eTag dedup prevents re-uploading files already in the channel walk.
-        await _process_site_drives(
-            graph, pool, semaphore, stats,
-            team_id=team_id,
-            team_name=team_name,
-            curso_id=curso_id,
-            professor_id=professor_id,
-            download_root=download_root,
-            known_site_id=known_site_id,
-        )
+    await asyncio.gather(
+        *[
+            _process_team(graph, pool, semaphore, stats, team, download_root)
+            for team in teams
+        ],
+        return_exceptions=True,
+    )
 
     log.info("All teams processed.")
     return stats
