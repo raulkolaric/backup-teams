@@ -146,22 +146,37 @@ class GraphClient:
 
     async def get_team_drive(self, team_id: str) -> dict:
         """
-        Return the default SharePoint drive for a team.
-
-        The response includes `parentReference.siteId` which identifies
-        the SharePoint site — needed to enumerate all document libraries.
+        Return the default SharePoint drive for a team via the Teams endpoint.
+        Returns 404 when the institution uses non-standard SharePoint provisioning.
+        In that case, use get_group_drive() as a fallback.
         """
         return await self._get(f"/teams/{team_id}/drive")
+
+    async def get_group_drive(self, group_id: str) -> dict:
+        """
+        Return the SharePoint drive for a Microsoft 365 Group (same ID as the team).
+        Fallback when /teams/{id}/drive returns 404 — the /groups path has different
+        routing logic and often succeeds where /teams fails.
+        """
+        return await self._get(f"/groups/{group_id}/drive")
 
     async def list_site_drives(self, site_id: str) -> List[dict]:
         """
         Return all document libraries (drives) on a SharePoint site.
-
-        This is how we find custom libraries like 'Material de Aula'
-        that professors create instead of using the default Teams files tab.
-        The default 'Documents'/'Arquivos' library is included in the list.
         """
         return await self._get_all(f"/sites/{site_id}/drives")
+
+    async def get_site_by_url(self, hostname: str, site_path: str) -> dict:
+        """
+        Resolve a SharePoint site by its URL components when siteId fields
+        are null in drive responses (common for non-standard provisioning).
+
+        Example:
+          hostname  = "pucsp.sharepoint.com"
+          site_path = "/sites/452516_4385_2"
+          → GET /sites/pucsp.sharepoint.com:/sites/452516_4385_2
+        """
+        return await self._get(f"/sites/{hostname}:{site_path}")
 
     async def get_drive_root(self, drive_id: str) -> dict:
         """Return the root DriveItem of a drive (starting point for walking)."""

@@ -3,21 +3,20 @@ src/teams_scraper.py — Top-level orchestration.
 
 Walk order:
   Teams (Curso) → Channels (Class) → File tree (folders + files)
+  + Site Drives (supplementary) — catches custom SharePoint libraries
 
-For each Team we:
-  1. Upsert a `curso` row in the DB.
-  2. Detect the professor from team owners.
-  3. Try to list channels. If denied (403), fall back to primary channel.
-     Retries up to MAX_CHANNEL_RETRIES times with CHANNEL_RETRY_DELAY seconds
-     between attempts before giving up.
-  4. For each channel, upsert a `class` row and recursively walk the
-     channel's SharePoint drive.
+Site drives strategy:
+  The primary path to custom document libraries (e.g. 'Material de Aula') is
+  through the siteId embedded in the filesFolder response we already retrieve
+  during channel processing. This avoids the broken /teams/{id}/drive endpoint
+  which returns 404 when the institution uses non-standard SharePoint provisioning.
 
-End-of-run report
------------------
-A summary table is printed after all teams are processed, showing:
-  - Teams processed / denied
-  - Files new (uploaded to S3) / skipped / errored
+  For teams where channels are denied (403), we fall back to the /groups/{id}/drive
+  path (same group ID as the team ID) which has different routing and often
+  succeeds where /teams/{id}/drive fails.
+
+End-of-run report:
+  Printed after all teams are processed: teams, channels, files, errors.
 """
 import asyncio
 import logging
@@ -38,20 +37,20 @@ log = logging.getLogger("backup_teams.scraper")
 
 DOWNLOAD_CONCURRENCY  = int(os.getenv("DOWNLOAD_CONCURRENCY", "4"))
 MAX_CHANNEL_RETRIES   = 2
-CHANNEL_RETRY_DELAY   = 5   # seconds between retry attempts
+CHANNEL_RETRY_DELAY   = 5
 
 
 # ─── Stats ─────────────────────────────────────────────────────────────────────
 
 @dataclass
 class ScrapingStats:
-    teams_total:   int = 0
-    teams_denied:  int = 0   # 403 even after retries — no files recovered
-    teams_fallback: int = 0  # 403 on channels but primary channel worked
+    teams_total:    int = 0
+    teams_denied:   int = 0
+    teams_fallback: int = 0
     channels_total: int = 0
-    files_new:     int = 0   # successfully uploaded to S3
-    files_skipped: int = 0   # etag match — already current
-    files_error:   int = 0   # download or S3 failure
+    files_new:      int = 0
+    files_skipped:  int = 0
+    files_error:    int = 0
 
     def report(self) -> str:
         lines = [
@@ -173,16 +172,9 @@ async def _get_channels_with_fallback(
     team_name: str,
     stats: ScrapingStats,
 ) -> Optional[list]:
-    """
-    Try to list all channels. On 403, retry up to MAX_CHANNEL_RETRIES times
-    with CHANNEL_RETRY_DELAY seconds between attempts.
-
-    If all retries fail, fall back to the primary channel.
-    Returns a list of channel dicts, or None if access is fully denied.
-    """
     last_exc = None
 
-    for attempt in range(1, MAX_CHANNEL_RETRIES + 2):   # +2 = initial + retries
+    for attempt in range(1, MAX_CHANNEL_RETRIES + 2):
         try:
             return await graph.list_channels(team_id)
         except Exception as exc:
@@ -198,7 +190,6 @@ async def _get_channels_with_fallback(
             else:
                 break
 
-    # All retries exhausted — try primary channel fallback
     log.warning(
         "Channel list denied for %s after %d attempts — trying primary channel",
         team_name, MAX_CHANNEL_RETRIES + 1,
@@ -216,11 +207,75 @@ async def _get_channels_with_fallback(
         return None
 
 
-# ─── Site-level drive enumeration ─────────────────────────────────────────────
+# ─── Site drives enumeration ───────────────────────────────────────────────────
 
-# Library names that are the default Teams document library — already covered
-# by the channel filesFolder walk, so we skip them here to avoid duplicates.
 _DEFAULT_LIBRARY_NAMES = {"documents", "arquivos", "documentos"}
+
+
+async def _get_site_id_for_team(
+    graph: GraphClient,
+    team_id: str,
+    team_name: str,
+    known_site_id: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Resolve the SharePoint siteId for a team.
+
+    Priority:
+      1. known_site_id  — extracted from a filesFolder response (fast path)
+      2. Parse webUrl from /groups/{id}/drive or /teams/{id}/drive response
+         → GET /sites/{host}:{site_path} to get the real site ID
+
+    The siteId fields (parentReference.siteId, sharePointIds) are null for
+    institutions with non-standard SharePoint provisioning. The webUrl is
+    always present and gives us enough to resolve the site.
+    """
+    from urllib.parse import urlparse
+
+    if known_site_id:
+        return known_site_id
+
+    for label, drive_coro in [
+        ("groups drive", graph.get_group_drive(team_id)),
+        ("teams drive",  graph.get_team_drive(team_id)),
+    ]:
+        try:
+            drive = await drive_coro
+        except Exception as exc:
+            log.debug("[DRIVES] %s failed for %s: %s", label, team_name, exc)
+            continue
+
+        # Try direct siteId fields first (standard provisioning)
+        site_id = (
+            (drive.get("parentReference") or {}).get("siteId")
+            or (drive.get("sharePointIds") or {}).get("siteId")
+        )
+        if site_id:
+            log.debug("[DRIVES] Got siteId via %s fields for %s", label, team_name)
+            return site_id
+
+        # Fall back to webUrl parsing (always present, even when siteId is null)
+        web_url = drive.get("webUrl", "")
+        if "/sites/" in web_url:
+            parsed = urlparse(web_url)
+            # webUrl is like: https://pucsp.sharepoint.com/sites/452516_4385_2/Documentos...
+            # We want the site path:  /sites/452516_4385_2
+            path_parts = parsed.path.split("/")
+            site_path = "/" + "/".join(path_parts[1:3])   # [sites, name]
+            try:
+                site = await graph.get_site_by_url(parsed.hostname, site_path)
+                site_id = site.get("id")
+                if site_id:
+                    log.debug(
+                        "[DRIVES] Got siteId via webUrl (%s) for %s",
+                        web_url, team_name,
+                    )
+                    return site_id
+            except Exception as exc:
+                log.debug("[DRIVES] webUrl site resolve failed for %s: %s", team_name, exc)
+
+    log.warning("[DRIVES] Could not resolve siteId for %s", team_name)
+    return None
 
 
 async def _process_site_drives(
@@ -230,51 +285,38 @@ async def _process_site_drives(
     stats: ScrapingStats,
     *,
     team_id: str,
+    team_name: str,
     curso_id: UUID,
     professor_id: Optional[UUID],
     download_root: str,
-    curso_name: str,
+    known_site_id: Optional[str] = None,
 ) -> None:
     """
-    Enumerate ALL SharePoint document libraries for a team's site and walk
-    each non-default one.
+    Walk all non-default SharePoint document libraries for a team's site.
 
-    This recovers files from custom libraries (e.g. 'Material de Aula') that
-    are invisible via the standard channel /filesFolder endpoint.
-
-    Strategy:
-      1. GET /teams/{id}/drive          → get siteId from parentReference
-      2. GET /sites/{siteId}/drives     → list all document libraries
-      3. Walk each library that isn't the default Teams Documents folder
+    Uses known_site_id (from filesFolder) when available — avoids the broken
+    /teams/{id}/drive path. Falls back to /groups/{id}/drive if needed.
     """
-    try:
-        team_drive = await graph.get_team_drive(team_id)
-    except Exception as exc:
-        log.debug("[DRIVES] Could not get team drive for %s: %s", curso_name, exc)
-        return
-
-    site_id = team_drive.get("parentReference", {}).get("siteId")
+    site_id = await _get_site_id_for_team(
+        graph, team_id, team_name, known_site_id
+    )
     if not site_id:
-        log.debug("[DRIVES] No siteId found for %s", curso_name)
         return
 
     try:
         drives = await graph.list_site_drives(site_id)
     except Exception as exc:
-        log.debug("[DRIVES] Could not list site drives for %s: %s", curso_name, exc)
+        log.warning("[DRIVES] Could not list site drives for %s: %s", team_name, exc)
         return
-
-    log.debug("[DRIVES] %s — found %d libraries", curso_name, len(drives))
 
     for drive in drives:
         drive_name = drive.get("name", "unknown")
         drive_id   = drive["id"]
 
         if drive_name.lower() in _DEFAULT_LIBRARY_NAMES:
-            log.debug("[DRIVES] Skipping default library %r for %s", drive_name, curso_name)
             continue
 
-        log.info("[DRIVES] %s — walking library %r", curso_name, drive_name)
+        log.info("[DRIVES] %s — walking library %r", team_name, drive_name)
 
         class_id = await db_mod.upsert_class(
             pool,
@@ -292,7 +334,7 @@ async def _process_site_drives(
             log.warning("[DRIVES] Could not get root of %r: %s", drive_name, exc)
             continue
 
-        local_base = build_local_path(download_root, curso_name, drive_name)
+        local_base = build_local_path(download_root, team_name, drive_name)
 
         await _walk_folder(
             graph, pool, semaphore, stats,
@@ -317,7 +359,13 @@ async def _process_channel(
     professor_id: Optional[UUID],
     download_root: str,
     curso_name: str,
-) -> None:
+) -> Optional[str]:
+    """
+    Process a single channel's file tree.
+    Returns the SharePoint siteId discovered from the filesFolder response,
+    or None if the filesFolder could not be retrieved.
+    This siteId is used by the site drives pass to find custom libraries.
+    """
     channel_id   = channel["id"]
     channel_name = channel.get("displayName", "unknown-channel")
 
@@ -338,11 +386,17 @@ async def _process_channel(
         files_folder = await graph.get_files_folder(team_id, channel_id)
     except Exception as exc:
         log.warning("    No files folder for channel %s: %s", channel_name, exc)
-        return
+        return None
 
     drive_id     = files_folder["parentReference"]["driveId"]
     root_item_id = files_folder["id"]
-    local_base   = build_local_path(download_root, curso_name, channel_name)
+
+    # ── KEY: extract siteId from the filesFolder response ─────────────────────
+    # This is the actual SharePoint site ID for this team, regardless of whether
+    # /teams/{id}/drive works or not. Used by _process_site_drives.
+    site_id = files_folder.get("parentReference", {}).get("siteId")
+
+    local_base = build_local_path(download_root, curso_name, channel_name)
 
     await _walk_folder(
         graph, pool, semaphore, stats,
@@ -352,6 +406,8 @@ async def _process_channel(
         local_base=local_base,
     )
 
+    return site_id
+
 
 # ─── Public entry point ────────────────────────────────────────────────────────
 
@@ -359,10 +415,6 @@ async def scrape_all(
     graph: GraphClient,
     pool: asyncpg.Pool,
 ) -> ScrapingStats:
-    """
-    Main orchestration loop.
-    Returns a ScrapingStats object with the final counts.
-    """
     download_root = get_download_root()
     semaphore     = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
     stats         = ScrapingStats()
@@ -380,33 +432,46 @@ async def scrape_all(
         curso_id     = await db_mod.upsert_curso(pool, name=team_name, teams_id=team_id)
         professor_id = await _resolve_professor(graph, pool, team_id)
 
-        # ── Channel path (standard) ───────────────────────────────────────────
+        # ── Channel pass ─────────────────────────────────────────────────────
         channels = await _get_channels_with_fallback(graph, team_id, team_name, stats)
-        if channels is not None:
-            channel_tasks = [
-                _process_channel(
-                    graph, pool, semaphore, stats,
-                    team_id=team_id,
-                    channel=ch,
-                    curso_id=curso_id,
-                    professor_id=professor_id,
-                    download_root=download_root,
-                    curso_name=team_name,
-                )
-                for ch in channels
-            ]
-            await asyncio.gather(*channel_tasks, return_exceptions=True)
 
-        # ── Site drives path (supplementary) ──────────────────────────────────
-        # Always run — catches custom libraries (e.g. 'Material de Aula') that
-        # are invisible via channel /filesFolder. eTag dedup prevents re-uploads.
+        known_site_id: Optional[str] = None
+
+        if channels is not None:
+            # Process channels concurrently; collect siteId from any that succeed
+            channel_results = await asyncio.gather(
+                *[
+                    _process_channel(
+                        graph, pool, semaphore, stats,
+                        team_id=team_id,
+                        channel=ch,
+                        curso_id=curso_id,
+                        professor_id=professor_id,
+                        download_root=download_root,
+                        curso_name=team_name,
+                    )
+                    for ch in channels
+                ],
+                return_exceptions=True,
+            )
+            # Take the first non-None siteId returned by any channel
+            for result in channel_results:
+                if isinstance(result, str) and result:
+                    known_site_id = result
+                    break
+
+        # ── Site drives pass ─────────────────────────────────────────────────
+        # Always run — uses known_site_id from filesFolder when available,
+        # falls back to /groups/{id}/drive for denied teams.
+        # eTag dedup prevents re-uploading files already in the channel walk.
         await _process_site_drives(
             graph, pool, semaphore, stats,
             team_id=team_id,
+            team_name=team_name,
             curso_id=curso_id,
             professor_id=professor_id,
             download_root=download_root,
-            curso_name=team_name,
+            known_site_id=known_site_id,
         )
 
     log.info("All teams processed.")
