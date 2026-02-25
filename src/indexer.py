@@ -105,7 +105,10 @@ async def run_incremental(pool: asyncpg.Pool) -> int:
 
 async def _backfill():
     from dotenv import load_dotenv
+    from src.utils import setup_logging
+    
     load_dotenv()
+    setup_logging()
 
     dsn = (
         f"postgresql://{os.environ['DB_USER']}:{os.environ['DB_PASSWORD']}"
