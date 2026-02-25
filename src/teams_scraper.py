@@ -216,6 +216,93 @@ async def _get_channels_with_fallback(
         return None
 
 
+# ─── Site-level drive enumeration ─────────────────────────────────────────────
+
+# Library names that are the default Teams document library — already covered
+# by the channel filesFolder walk, so we skip them here to avoid duplicates.
+_DEFAULT_LIBRARY_NAMES = {"documents", "arquivos", "documentos"}
+
+
+async def _process_site_drives(
+    graph: GraphClient,
+    pool: asyncpg.Pool,
+    semaphore: asyncio.Semaphore,
+    stats: ScrapingStats,
+    *,
+    team_id: str,
+    curso_id: UUID,
+    professor_id: Optional[UUID],
+    download_root: str,
+    curso_name: str,
+) -> None:
+    """
+    Enumerate ALL SharePoint document libraries for a team's site and walk
+    each non-default one.
+
+    This recovers files from custom libraries (e.g. 'Material de Aula') that
+    are invisible via the standard channel /filesFolder endpoint.
+
+    Strategy:
+      1. GET /teams/{id}/drive          → get siteId from parentReference
+      2. GET /sites/{siteId}/drives     → list all document libraries
+      3. Walk each library that isn't the default Teams Documents folder
+    """
+    try:
+        team_drive = await graph.get_team_drive(team_id)
+    except Exception as exc:
+        log.debug("[DRIVES] Could not get team drive for %s: %s", curso_name, exc)
+        return
+
+    site_id = team_drive.get("parentReference", {}).get("siteId")
+    if not site_id:
+        log.debug("[DRIVES] No siteId found for %s", curso_name)
+        return
+
+    try:
+        drives = await graph.list_site_drives(site_id)
+    except Exception as exc:
+        log.debug("[DRIVES] Could not list site drives for %s: %s", curso_name, exc)
+        return
+
+    log.debug("[DRIVES] %s — found %d libraries", curso_name, len(drives))
+
+    for drive in drives:
+        drive_name = drive.get("name", "unknown")
+        drive_id   = drive["id"]
+
+        if drive_name.lower() in _DEFAULT_LIBRARY_NAMES:
+            log.debug("[DRIVES] Skipping default library %r for %s", drive_name, curso_name)
+            continue
+
+        log.info("[DRIVES] %s — walking library %r", curso_name, drive_name)
+
+        class_id = await db_mod.upsert_class(
+            pool,
+            name=drive_name,
+            curso_id=curso_id,
+            professor_id=professor_id,
+            semester=os.getenv("DEFAULT_SEMESTER", "Unknown"),
+            class_year=int(os.getenv("DEFAULT_YEAR", "2025")),
+            teams_channel_id=f"drive:{drive_id}",
+        )
+
+        try:
+            root = await graph.get_drive_root(drive_id)
+        except Exception as exc:
+            log.warning("[DRIVES] Could not get root of %r: %s", drive_name, exc)
+            continue
+
+        local_base = build_local_path(download_root, curso_name, drive_name)
+
+        await _walk_folder(
+            graph, pool, semaphore, stats,
+            drive_id=drive_id,
+            item_id=root["id"],
+            class_id=class_id,
+            local_base=local_base,
+        )
+
+
 # ─── Channel processing ────────────────────────────────────────────────────────
 
 async def _process_channel(
@@ -293,23 +380,34 @@ async def scrape_all(
         curso_id     = await db_mod.upsert_curso(pool, name=team_name, teams_id=team_id)
         professor_id = await _resolve_professor(graph, pool, team_id)
 
+        # ── Channel path (standard) ───────────────────────────────────────────
         channels = await _get_channels_with_fallback(graph, team_id, team_name, stats)
-        if channels is None:
-            continue
+        if channels is not None:
+            channel_tasks = [
+                _process_channel(
+                    graph, pool, semaphore, stats,
+                    team_id=team_id,
+                    channel=ch,
+                    curso_id=curso_id,
+                    professor_id=professor_id,
+                    download_root=download_root,
+                    curso_name=team_name,
+                )
+                for ch in channels
+            ]
+            await asyncio.gather(*channel_tasks, return_exceptions=True)
 
-        channel_tasks = [
-            _process_channel(
-                graph, pool, semaphore, stats,
-                team_id=team_id,
-                channel=ch,
-                curso_id=curso_id,
-                professor_id=professor_id,
-                download_root=download_root,
-                curso_name=team_name,
-            )
-            for ch in channels
-        ]
-        await asyncio.gather(*channel_tasks, return_exceptions=True)
+        # ── Site drives path (supplementary) ──────────────────────────────────
+        # Always run — catches custom libraries (e.g. 'Material de Aula') that
+        # are invisible via channel /filesFolder. eTag dedup prevents re-uploads.
+        await _process_site_drives(
+            graph, pool, semaphore, stats,
+            team_id=team_id,
+            curso_id=curso_id,
+            professor_id=professor_id,
+            download_root=download_root,
+            curso_name=team_name,
+        )
 
     log.info("All teams processed.")
     return stats

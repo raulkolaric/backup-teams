@@ -144,6 +144,29 @@ class GraphClient:
         """List direct children of a drive item (folder contents)."""
         return await self._get_all(f"/drives/{drive_id}/items/{item_id}/children")
 
+    async def get_team_drive(self, team_id: str) -> dict:
+        """
+        Return the default SharePoint drive for a team.
+
+        The response includes `parentReference.siteId` which identifies
+        the SharePoint site — needed to enumerate all document libraries.
+        """
+        return await self._get(f"/teams/{team_id}/drive")
+
+    async def list_site_drives(self, site_id: str) -> List[dict]:
+        """
+        Return all document libraries (drives) on a SharePoint site.
+
+        This is how we find custom libraries like 'Material de Aula'
+        that professors create instead of using the default Teams files tab.
+        The default 'Documents'/'Arquivos' library is included in the list.
+        """
+        return await self._get_all(f"/sites/{site_id}/drives")
+
+    async def get_drive_root(self, drive_id: str) -> dict:
+        """Return the root DriveItem of a drive (starting point for walking)."""
+        return await self._get(f"/drives/{drive_id}/root")
+
     async def get_team_members(self, team_id: str) -> List[dict]:
         """
         Return membership of a team. Members with roles=["owner"] are owners
