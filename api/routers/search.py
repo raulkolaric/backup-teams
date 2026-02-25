@@ -22,7 +22,7 @@ router = APIRouter()
 async def search_files(
     q: str = Query(..., min_length=2, description="Search terms"),
     curso_id: Optional[str] = Query(None, description="Filter to a specific team UUID"),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(5, ge=1, le=100),
     pool: asyncpg.Pool = Depends(get_pool),
 ) -> list:
     """
@@ -35,36 +35,61 @@ async def search_files(
     - `ts_rank_cd` scores by term density + position
     - `ts_headline` returns a snippet with matched terms wrapped in `<b>` tags
     """
-    # Sanitize query — replace spaces with & for AND semantics
-    # Users can use natural language; we convert to tsquery format
-    terms = " & ".join(q.strip().split())
+    # Pass the exact raw phrase to phraseto_tsquery to enforce word order and distance
+    terms = q.strip()
 
     try:
         rows = await pool.fetch(
             """
+            WITH top_docs AS (
+                SELECT
+                    a.id,
+                    a.file_name AS name,
+                    a.file_extension AS extension,
+                    a.s3_key,
+                    cl.name AS class_name,
+                    cr.name AS curso_name,
+                    a.content_text,
+                    ts_rank_cd(a.content_tsv, query) AS doc_rank,
+                    query
+                FROM archive a
+                JOIN class cl ON cl.id = a.class_id
+                JOIN curso cr ON cr.id = cl.curso_id,
+                phraseto_tsquery('portuguese', $1) query
+                WHERE a.content_tsv @@ query
+                  AND ($2::uuid IS NULL OR cl.curso_id = $2::uuid)
+                ORDER BY doc_rank DESC
+                LIMIT $3
+            ),
+            paragraphs AS (
+                SELECT
+                    id, name, extension, s3_key, class_name, curso_name, doc_rank, query,
+                    unnest(string_to_array(content_text, E'\n\n')) AS paragraph
+                FROM top_docs
+            ),
+            ranked_paragraphs AS (
+                SELECT
+                    id, name, extension, s3_key, class_name, curso_name, doc_rank, query, paragraph,
+                    ts_rank_cd(to_tsvector('portuguese', paragraph), query) AS para_rank
+                FROM paragraphs
+                WHERE to_tsvector('portuguese', paragraph) @@ query
+            ),
+            best_paragraphs AS (
+                SELECT DISTINCT ON (id)
+                    id, name, extension, s3_key, class_name, curso_name, doc_rank,
+                    ts_headline(
+                        'portuguese',
+                        paragraph,
+                        query,
+                        'HighlightAll=TRUE, StartSel=<b>, StopSel=</b>'
+                    ) AS excerpt
+                FROM ranked_paragraphs
+                ORDER BY id, para_rank DESC
+            )
             SELECT
-                a.id,
-                a.file_name AS name,
-                a.file_extension AS extension,
-                a.s3_key,
-                cl.name   AS class_name,
-
-                cr.name   AS curso_name,
-                ts_rank_cd(a.content_tsv, query)                            AS rank,
-                ts_headline(
-                    'portuguese',
-                    left(a.content_text, 50000),  -- headline limit
-                    query,
-                    'MaxWords=35, MinWords=15, StartSel=<b>, StopSel=</b>'
-                )                                                            AS excerpt
-            FROM archive a
-            JOIN class cl  ON cl.id  = a.class_id
-            JOIN curso cr  ON cr.id  = cl.curso_id,
-            to_tsquery('portuguese', $1) query
-            WHERE a.content_tsv @@ query
-              AND ($2::uuid IS NULL OR cl.curso_id = $2::uuid)
-            ORDER BY rank DESC
-            LIMIT $3
+                id, name, extension, s3_key, class_name, curso_name, doc_rank AS rank, excerpt
+            FROM best_paragraphs
+            ORDER BY rank DESC;
             """,
             terms, curso_id, limit,
         )
