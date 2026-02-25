@@ -160,22 +160,25 @@ async def upsert_archive(
     local_path: str,
     drive_item_id: str,
     etag: str,
+    s3_key: Optional[str] = None,
 ) -> UUID:
     """Insert or update an archive record after a successful download."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO archive
-                (class_id, file_name, file_extension, local_path, drive_item_id, etag)
-            VALUES ($1, $2, $3, $4, $5, $6)
+                (class_id, file_name, file_extension, local_path, s3_key, drive_item_id, etag)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (drive_item_id) DO UPDATE
                 SET file_name      = EXCLUDED.file_name,
                     file_extension = EXCLUDED.file_extension,
                     local_path     = EXCLUDED.local_path,
+                    s3_key         = EXCLUDED.s3_key,
                     etag           = EXCLUDED.etag,
                     updated_at     = NOW()
             RETURNING id
             """,
-            class_id, file_name, file_extension, local_path, drive_item_id, etag,
+            class_id, file_name, file_extension, local_path, s3_key, drive_item_id, etag,
         )
     return row["id"]
+

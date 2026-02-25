@@ -36,6 +36,12 @@ services:
       DOWNLOAD_CONCURRENCY: ${DOWNLOAD_CONCURRENCY:-4}
       DEFAULT_SEMESTER: ${DEFAULT_SEMESTER:-2025/1}
       DEFAULT_YEAR: ${DEFAULT_YEAR:-2025}
+      # ── AWS S3 ─────────────────────────────────────────────────────────────
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-}
+      DELETE_LOCAL_AFTER_UPLOAD: ${DELETE_LOCAL_AFTER_UPLOAD:-false}
     volumes:
       - ./downloads:/data/downloads # host folder ↔ container path
     # The scraper needs a display for Playwright (headless=False for auth).
