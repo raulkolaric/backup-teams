@@ -1,0 +1,27 @@
+name: Deploy API to EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Navigate to the repository directory
+            cd ~/backup-teams || exit 1
+            
+            # Pull the latest changes from main
+            git pull origin main
+            
+            # Rebuild and restart the API container
+            docker compose -f docker-compose.prod.yml up -d --build api
