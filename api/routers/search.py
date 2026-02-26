@@ -31,11 +31,11 @@ async def search_files(
     Returns files ranked by relevance with a highlighted excerpt showing
     where the query terms appear in the document.
 
-    - Uses PostgreSQL `tsvector` / `to_tsquery` with portuguese stemming
+    - Uses PostgreSQL `tsvector` / `websearch_to_tsquery` with portuguese stemming
     - `ts_rank_cd` scores by term density + position
     - `ts_headline` returns a snippet with matched terms wrapped in `<b>` tags
     """
-    # Pass the exact raw phrase to phraseto_tsquery to enforce word order and distance
+    # Uses websearch_to_tsquery for Elasticsearch-like syntax (supports "quotes" and -exclusions)
     terms = q.strip()
 
     try:
@@ -55,7 +55,7 @@ async def search_files(
                 FROM archive a
                 JOIN class cl ON cl.id = a.class_id
                 JOIN curso cr ON cr.id = cl.curso_id,
-                phraseto_tsquery('portuguese', $1) query
+                websearch_to_tsquery('portuguese', $1) query
                 WHERE a.content_tsv @@ query
                   AND ($2::uuid IS NULL OR cl.curso_id = $2::uuid)
                 ORDER BY doc_rank DESC
