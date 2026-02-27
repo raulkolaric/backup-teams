@@ -27,7 +27,6 @@ alembic upgrade head
 # Create a new blank Alembic migration script (when you change db/models)
 alembic revision -m "description_of_change"
 
-
 ## 3. Running the Application
 # Start the offline Microsoft Teams Playwright scraper
 python main.py
