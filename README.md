@@ -47,12 +47,12 @@ The downloader sub-system explicitly bypasses local block storage. File streams 
 
 - **Backend Logic:** Python 3.12, FastAPI, `asyncio`, Uvicorn
 - **Persistent Data:** PostgreSQL 16 (AWS RDS), `asyncpg`, Alembic 
-- **Cloud Infrastructure:** AWS S3 (`boto3`), AWS EC2 (Ubuntu 24.04), Docker Engine Component 
+- **Cloud Infrastructure:** AWS S3 (`boto3`), AWS EC2 (Ubuntu 24.04), Docker 
 - **Extraction Protocol:** Playwright (Chromium), `httpx` (HTTP/2), `pdfminer.six`
 
 ---
 
-## Deployment Parameters
+## 
 
 **Prerequisites:** Docker Engine, Python 3.12, Git.
 
