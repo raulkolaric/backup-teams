@@ -1,0 +1,64 @@
+# Backup Teams - Essential Commands Cheat Sheet
+
+This file acts as a quick reference for every major operational command used in this project.
+
+## 1. Local Environment & Setup (Mac/Linux)
+# Create and activate a virtual environment
+python -m venv venv
+source venv/bin/activate
+
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Install Playwright browser binaries (required for scraper)
+playwright install chromium --with-deps
+
+
+## 2. Infrastructure & Database (Local)
+# Start the local PostgreSQL database in the background via Docker
+docker compose up db -d
+
+# Stop the local database
+docker compose down
+
+# Apply all pending Alembic schema migrations to your database
+alembic upgrade head
+
+# Create a new blank Alembic migration script (when you change db/models)
+alembic revision -m "description_of_change"
+
+
+## 3. Running the Application
+# Start the offline Microsoft Teams Playwright scraper
+python main.py
+
+# Start the FastAPI Web Server (local development, hot-reloading enabled)
+uvicorn api.main:app --reload
+# Access docs at: http://127.0.0.1:8000/docs
+
+
+## 4. Testing
+# Run the entire asynchronous test suite with verbose output
+pytest tests/ -v
+
+
+## 5. Deployment & Production (AWS EC2)
+# SSH into the production EC2 instance
+ssh -i ~/Downloads/backup-teams-key.pem ubuntu@3.149.11.55
+
+# Rebuild and restart the production API container (done automatically by CI/CD)
+docker compose -f docker-compose.prod.yml up -d --build api
+
+# View real-time logs from the production FastAPI server
+docker compose -f docker-compose.prod.yml logs -f api
+
+# Stop the production container
+docker compose -f docker-compose.prod.yml down
+
+
+## 6. GitHub Interactions (Antigravity Workflows)
+# Quickly stage, commit, and push all current changes securely bypassing tests
+/[quick-commit]
+
+# Stage, fully automatically test (pytest), commit, and push changes
+/[commit]
