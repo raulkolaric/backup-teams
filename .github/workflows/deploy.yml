@@ -23,7 +23,13 @@ jobs:
             # Pull the latest changes from main
             git pull origin main
             
-            # 🚀 SECRETS MANAGEMENT 🚀
+            # SECRETS MANAGEMENT
+            # Install AWS CLI if it is missing on the EC2 server
+            if ! command -v aws &> /dev/null; then
+               echo "AWS CLI not found. Installing..."
+               sudo apt-get update -y && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y awscli
+            fi
+
             # Fetch the entire .env file blob securely from AWS Parameter Store
             # and write it to the local .env file so Docker can read it.
             echo "Fetching secrets from AWS SSM..."
