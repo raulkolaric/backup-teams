@@ -40,7 +40,7 @@ jobs:
             aws ssm get-parameter \
               --name "/backup-teams/prod/dotenv" \
               --with-decryption \
-              --region us-east-1 \
+              --region us-east-2 \
               --query "Parameter.Value" \
               --output text > .env
               
