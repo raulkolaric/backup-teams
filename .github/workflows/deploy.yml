@@ -25,3 +25,6 @@ jobs:
             
             # Rebuild and restart all containers (Nginx + API)
             docker compose -f docker-compose.prod.yml up -d --build
+            
+            # Apply database migrations automatically against RDS
+            docker compose -f docker-compose.prod.yml exec -T api alembic upgrade head
