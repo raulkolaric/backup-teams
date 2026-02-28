@@ -24,10 +24,14 @@ jobs:
             git pull origin main
             
             # SECRETS MANAGEMENT
-            # Install AWS CLI if it is missing on the EC2 server
+            # Install AWS CLI via official zip if it is missing on the EC2 server
             if ! command -v aws &> /dev/null; then
-               echo "AWS CLI not found. Installing..."
-               sudo apt-get update -y && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y awscli
+               echo "AWS CLI not found. Installing via official curl zip..."
+               curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+               sudo apt-get update -y && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y unzip
+               unzip -q awscliv2.zip
+               sudo ./aws/install
+               rm -rf awscliv2.zip aws
             fi
 
             # Fetch the entire .env file blob securely from AWS Parameter Store
