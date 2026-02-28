@@ -23,6 +23,20 @@ jobs:
             # Pull the latest changes from main
             git pull origin main
             
+            # 🚀 SECRETS MANAGEMENT 🚀
+            # Fetch the entire .env file blob securely from AWS Parameter Store
+            # and write it to the local .env file so Docker can read it.
+            echo "Fetching secrets from AWS SSM..."
+            aws ssm get-parameter \
+              --name "/backup-teams/prod/dotenv" \
+              --with-decryption \
+              --region us-east-1 \
+              --query "Parameter.Value" \
+              --output text > .env
+              
+            # Ensure the permissions are strict (only the owner can read it)
+            chmod 600 .env
+            
             # Rebuild and restart all containers (Nginx + API)
             docker compose -f docker-compose.prod.yml up -d --build
             
