@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Query
 import asyncpg
 
 from api.dependencies.db import get_pool
+from api.dependencies.security import get_current_user
 
 router = APIRouter()
 
@@ -14,6 +15,7 @@ router = APIRouter()
 async def list_cursos(
     semester: Optional[str] = Query(None, description="e.g. '2025/2'"),
     pool: asyncpg.Pool = Depends(get_pool),
+    current_user: str = Depends(get_current_user)
 ) -> list:
     """
     List all Teams (cursos) with their file counts.
@@ -42,6 +44,7 @@ async def list_cursos(
 async def list_curso_classes(
     curso_id: str,
     pool: asyncpg.Pool = Depends(get_pool),
+    current_user: str = Depends(get_current_user)
 ) -> list:
     """
     List all classes (channels) within a team, with file counts.

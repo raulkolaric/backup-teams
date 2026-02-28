@@ -6,12 +6,16 @@ from fastapi import APIRouter, Depends
 import asyncpg
 
 from api.dependencies.db import get_pool
+from api.dependencies.security import get_current_user
 
 router = APIRouter()
 
 
 @router.get("/")
-async def get_stats(pool: asyncpg.Pool = Depends(get_pool)) -> dict:
+async def get_stats(
+    pool: asyncpg.Pool = Depends(get_pool),
+    current_user: str = Depends(get_current_user)
+) -> dict:
     """
     High-level statistics about the backup corpus.
 

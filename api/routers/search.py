@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 import asyncpg
 
 from api.dependencies.db import get_pool
+from api.dependencies.security import get_current_user
 
 router = APIRouter()
 
@@ -24,6 +25,7 @@ async def search_files(
     curso_id: Optional[str] = Query(None, description="Filter to a specific team UUID"),
     limit: int = Query(5, ge=1, le=100),
     pool: asyncpg.Pool = Depends(get_pool),
+    current_user: str = Depends(get_current_user)
 ) -> list:
     """
     Search across the full text of all indexed PDFs.

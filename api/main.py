@@ -33,6 +33,9 @@ app = FastAPI(
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=["*"])
 
 # ── Routers ───────────────────────────────────────────────────────────────────
+from api.routers import auth
+app.include_router(auth.router,    prefix="/auth",    tags=["Auth"])
+
 app.include_router(stats.router,   prefix="/stats",   tags=["Stats"])
 app.include_router(cursos.router,  prefix="/cursos",  tags=["Cursos"])
 app.include_router(classes.router, prefix="/classes", tags=["Classes"])

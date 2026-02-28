@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 import asyncpg
 
 from api.dependencies.db import get_pool
+from api.dependencies.security import get_current_user
 from api.services.s3 import generate_presigned_url
 
 router = APIRouter()
@@ -19,6 +20,7 @@ async def list_files(
     limit:  int = Query(50,  ge=1, le=200),
     offset: int = Query(0,   ge=0),
     pool: asyncpg.Pool = Depends(get_pool),
+    current_user: str = Depends(get_current_user)
 ) -> list:
     """
     Paginated file listing, filterable by class, team, or extension.
@@ -47,6 +49,7 @@ async def list_files(
 async def get_file(
     file_id: str,
     pool: asyncpg.Pool = Depends(get_pool),
+    current_user: str = Depends(get_current_user)
 ) -> dict:
     """
     Get metadata for a single file plus a presigned S3 download URL.

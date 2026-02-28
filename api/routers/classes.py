@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 import asyncpg
 
 from api.dependencies.db import get_pool
+from api.dependencies.security import get_current_user
 
 router = APIRouter()
 
@@ -18,6 +19,7 @@ async def list_classes(
     limit:  int = Query(50,  ge=1, le=200),
     offset: int = Query(0,   ge=0),
     pool: asyncpg.Pool = Depends(get_pool),
+    current_user: str = Depends(get_current_user)
 ) -> list:
     """
     List all classes (channels), optionally filtered by team, semester, or year.
@@ -49,6 +51,7 @@ async def list_class_files(
     limit:  int = Query(50, ge=1, le=200),
     offset: int = Query(0,  ge=0),
     pool: asyncpg.Pool = Depends(get_pool),
+    current_user: str = Depends(get_current_user)
 ) -> list:
     """
     All files belonging to a specific class (channel), paginated.
