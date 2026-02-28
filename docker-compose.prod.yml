@@ -1,10 +1,19 @@
 # docker-compose.prod.yml
 services:
+  nginx:
+    build: nginx/
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - api
+
   api:
     build: .
     restart: unless-stopped
-    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "80"]
+    command: [ "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "80", "--forwarded-allow-ips", "*", "--proxy-headers" ]
     env_file:
       - .env
-    ports:
-      - "80:80"
+    expose:
+      - "80"

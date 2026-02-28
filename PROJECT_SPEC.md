@@ -46,7 +46,7 @@ Instead of standard FTS excerpts, the system treats paragraphs as first-class ci
 2. Segment document text into arrays using `\n\n`.
 3. Compute rank for each individual segment.
 4. Return the "winning" segment as the `excerpt`.
-
+ 
 ### The "Senior" Deployment Standard
 - **Backend:** Managed as an immutable container on EC2.
 - **Frontend:** Managed as an edge-optimized static site on Vercel.

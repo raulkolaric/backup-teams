@@ -14,6 +14,8 @@ load_dotenv()
 
 from fastapi import FastAPI
 
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
 from api.dependencies.db import lifespan
 from api.routers import files, classes, stats, cursos, search
 
@@ -26,6 +28,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# Trust headers like X-Forwarded-Proto and X-Forwarded-For injected by Nginx
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=["*"])
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(stats.router,   prefix="/stats",   tags=["Stats"])
