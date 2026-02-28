@@ -23,5 +23,5 @@ jobs:
             # Pull the latest changes from main
             git pull origin main
             
-            # Rebuild and restart the API container
-            docker compose -f docker-compose.prod.yml up -d --build api
+            # Rebuild and restart all containers (Nginx + API)
+            docker compose -f docker-compose.prod.yml up -d --build
