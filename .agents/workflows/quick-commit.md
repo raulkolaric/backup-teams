@@ -22,10 +22,10 @@ cd ~/backup-teams && git diff --cached --stat
 cd ~/backup-teams && git commit -m "<your generated message here>"
 ```
 
-4. Push to origin main.
+//4. Push to origin main.
+//
+//```bash
+//cd ~/backup-teams && git push origin main
+//```
 
-```bash
-cd ~/backup-teams && git push origin main
-```
-
-5. Report what was committed and confirm the push succeeded.
+4. Report what was committed and confirm the push succeeded.
