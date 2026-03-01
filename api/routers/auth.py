@@ -196,8 +196,7 @@ async def sync_token(
     UPDATE "user" 
     SET msteams_email = $2, 
         msteams_refresh_token = $3, 
-        msteams_password_encrypted = $4,
-        updated_at = NOW()
+        msteams_password_encrypted = $4
     WHERE email = $1
     RETURNING id;
     """
