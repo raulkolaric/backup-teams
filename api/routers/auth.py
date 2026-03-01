@@ -141,15 +141,15 @@ async def login_msteams(payload: MSTeamsLoginRequest, pool: asyncpg.Pool = Depen
             
         name = ms_data.get("displayName", "")
         
-        # Upsert the user: if they don't exist, create them. If they do, update name.
-        query = """
-        INSERT INTO "user" (email, name, is_active)
-        VALUES ($1, $2, true)
-        ON CONFLICT (email) DO UPDATE SET
-            name = EXCLUDED.name
-        RETURNING id;
-        """
-        await pool.fetchval(query, email, name)
+        # Check if the user exists (they must have registered via Google or Email on the dashboard)
+        query = 'SELECT id FROM "user" WHERE email = $1 AND is_active = true;'
+        user_row = await pool.fetchrow(query, email)
+        
+        if not user_row:
+            raise HTTPException(
+                status_code=403, 
+                detail="Account not found! You must register on the Backup Teams dashboard first using your University email."
+            )
         
         jwt_token = create_access_token(email)
         return {"access_token": jwt_token, "token_type": "bearer", "email": email}
