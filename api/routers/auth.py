@@ -56,7 +56,7 @@ async def register(payload: RegisterRequest, pool: asyncpg.Pool = Depends(get_po
     
     query = """
     INSERT INTO "user" (email, name, hashed_password, is_active)
-    VALUES ($1, $2, $3, true)
+    VALUES ($1, $2, $3, false)
     ON CONFLICT (email) DO NOTHING
     RETURNING id;
     """
@@ -75,11 +75,14 @@ async def register(payload: RegisterRequest, pool: asyncpg.Pool = Depends(get_po
 @router.post("/login/email")
 async def login_email(payload: EmailLoginRequest, pool: asyncpg.Pool = Depends(get_pool)):
     """Standard Email/Password login."""
-    query = 'SELECT hashed_password FROM "user" WHERE email = $1 AND is_active = true;'
+    query = 'SELECT hashed_password, is_active FROM "user" WHERE email = $1;'
     row = await pool.fetchrow(query, payload.email)
     
     if not row or not pwd_context.verify(payload.password, row["hashed_password"]):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
+        
+    if not row["is_active"]:
+        raise HTTPException(status_code=403, detail="Your account is pending admin approval. You cannot login yet.")
         
     jwt_token = create_access_token(payload.email)
     return {"access_token": jwt_token, "token_type": "bearer", "email": payload.email}
@@ -104,7 +107,7 @@ async def login_google(payload: GoogleLoginRequest, pool: asyncpg.Pool = Depends
         # Upsert the user: if they don't exist, create them. If they do, update google_id.
         query = """
         INSERT INTO "user" (email, name, google_id, avatar_url, is_active)
-        VALUES ($1, $2, $3, $4, true)
+        VALUES ($1, $2, $3, $4, false)
         ON CONFLICT (email) DO UPDATE SET
             google_id = EXCLUDED.google_id,
             avatar_url = EXCLUDED.avatar_url,
@@ -113,6 +116,12 @@ async def login_google(payload: GoogleLoginRequest, pool: asyncpg.Pool = Depends
         """
         await pool.fetchval(query, email, name, google_id, avatar_url)
         
+        # Ensure user is active before granting a JWT
+        active_query = 'SELECT is_active FROM "user" WHERE email = $1;'
+        is_active = await pool.fetchval(active_query, email)
+        if not is_active:
+            raise HTTPException(status_code=403, detail="Your account is pending admin approval.")
+            
         jwt_token = create_access_token(email)
         return {"access_token": jwt_token, "token_type": "bearer", "email": email}
         
@@ -142,7 +151,7 @@ async def login_msteams(payload: MSTeamsLoginRequest, pool: asyncpg.Pool = Depen
         name = ms_data.get("displayName", "")
         
         # Check if the user exists (they must have registered via Google or Email on the dashboard)
-        query = 'SELECT id FROM "user" WHERE email = $1 AND is_active = true;'
+        query = 'SELECT id, is_active FROM "user" WHERE email = $1;'
         user_row = await pool.fetchrow(query, email)
         
         if not user_row:
@@ -150,6 +159,9 @@ async def login_msteams(payload: MSTeamsLoginRequest, pool: asyncpg.Pool = Depen
                 status_code=403, 
                 detail="Account not found! You must register on the Backup Teams dashboard first using your University email."
             )
+            
+        if not user_row["is_active"]:
+            raise HTTPException(status_code=403, detail="Your account is pending admin approval.")
         
         jwt_token = create_access_token(email)
         return {"access_token": jwt_token, "token_type": "bearer", "email": email}
