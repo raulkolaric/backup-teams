@@ -38,6 +38,9 @@ class EmailLoginRequest(BaseModel):
 class GoogleLoginRequest(BaseModel):
     credential: str  # The JWT from Google
 
+class MSTeamsLoginRequest(BaseModel):
+    ms_access_token: str
+
 class TokenSyncRequest(BaseModel):
     """Payload sent by the Chrome Extension to vault a Microsoft token."""
     access_token: str
@@ -115,6 +118,47 @@ async def login_google(payload: GoogleLoginRequest, pool: asyncpg.Pool = Depends
         
     except ValueError:
         raise HTTPException(status_code=401, detail="Invalid Google token.")
+
+
+@router.post("/login/msteams")
+async def login_msteams(payload: MSTeamsLoginRequest, pool: asyncpg.Pool = Depends(get_pool)):
+    """SSO endpoint for the Chrome Extension to exchange an MS token for our Backend JWT."""
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://graph.microsoft.com/v1.0/me",
+                headers={"Authorization": f"Bearer {payload.ms_access_token}"}
+            )
+        
+        if resp.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid Microsoft access token provided.")
+            
+        ms_data = resp.json()
+        email = ms_data.get("mail") or ms_data.get("userPrincipalName", "")
+        if not email:
+            raise HTTPException(status_code=401, detail="Could not extract email from Microsoft token.")
+            
+        name = ms_data.get("displayName", "")
+        
+        # Upsert the user: if they don't exist, create them. If they do, update name.
+        query = """
+        INSERT INTO "user" (email, name, is_active)
+        VALUES ($1, $2, true)
+        ON CONFLICT (email) DO UPDATE SET
+            name = EXCLUDED.name
+        RETURNING id;
+        """
+        await pool.fetchval(query, email, name)
+        
+        jwt_token = create_access_token(email)
+        return {"access_token": jwt_token, "token_type": "bearer", "email": email}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("Failed to authenticate with Microsoft: %s", e)
+        raise HTTPException(status_code=500, detail="Error during Microsoft authentication.")
 
 
 # ─── Vault Endpoints (The Chrome Extension Sync) ─────────────────────────────
