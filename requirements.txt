@@ -21,3 +21,7 @@ boto3
 pdfminer.six
 
 PyJWT==2.8.0
+
+# ── Authentication ─────────────────────────────────────────────────────────────
+passlib[bcrypt]
+google-auth

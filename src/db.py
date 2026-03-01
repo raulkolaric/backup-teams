@@ -175,3 +175,15 @@ async def upsert_archive(
         )
     return row["id"]
 
+
+# ─── Auth / Identity ───────────────────────────────────────────────────────────
+
+async def get_system_token(pool: asyncpg.Pool, email: str) -> Optional[str]:
+    """Retrieve the vaulted Microsoft token for a specific user to use in the scraper."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            'SELECT msteams_password_encrypted FROM "user" WHERE email = $1',
+            email
+        )
+    return row["msteams_password_encrypted"] if row else None
+
