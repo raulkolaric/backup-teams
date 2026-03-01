@@ -36,14 +36,6 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         if email is None:
             raise HTTPException(status_code=401, detail="Invalid auth token payload")
         
-        # Here is where we enforce the restrict-to-creator logic as you requested:
-        # For now, it only permits your specific email, or an entire domain.
-        admin_email = os.environ.get("EMAIL", "").strip().lower()
-        if not admin_email or email.lower() != admin_email:
-            # Uncomment the below if you want to open it up to the whole domain instead of just you
-            # if not email.lower().endswith("@pucsp.edu.br"):
-            raise HTTPException(status_code=403, detail="Your account is not authorized to view the vault.")
-
         return email
         
     except jwt.ExpiredSignatureError:
