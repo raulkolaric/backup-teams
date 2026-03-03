@@ -8,11 +8,11 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-import asyncpg
 from passlib.context import CryptContext
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+from pydantic import BaseModel, field_validator
+import asyncpg
 
 from api.dependencies.db import get_pool
 from api.dependencies.security import create_access_token, get_current_user
@@ -20,8 +20,10 @@ from api.dependencies.security import create_access_token, get_current_user
 log = logging.getLogger("backup_teams.api.auth")
 router = APIRouter()
 
+import os
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID" # Will be fetched from env in a real app
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 
 
 # ─── Data Models ─────────────────────────────────────────────────────────────
@@ -31,9 +33,19 @@ class RegisterRequest(BaseModel):
     password: str
     name: str
 
+    @field_validator("email", mode="before")
+    @classmethod
+    def lower_email(cls, v: str) -> str:
+        return v.lower() if isinstance(v, str) else v
+
 class EmailLoginRequest(BaseModel):
     email: str
     password: str
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def lower_email(cls, v: str) -> str:
+        return v.lower() if isinstance(v, str) else v
 
 class GoogleLoginRequest(BaseModel):
     credential: str  # The JWT from Google
@@ -96,10 +108,10 @@ async def login_google(payload: GoogleLoginRequest, pool: asyncpg.Pool = Depends
         idinfo = id_token.verify_oauth2_token(
             payload.credential, 
             google_requests.Request(), 
-            # GOOGLE_CLIENT_ID  # Uncomment and enforce in production
+            GOOGLE_CLIENT_ID
         )
         
-        email = idinfo["email"]
+        email = idinfo["email"].lower()
         name = idinfo.get("name", "")
         google_id = idinfo["sub"]
         avatar_url = idinfo.get("picture", "")
@@ -144,9 +156,11 @@ async def login_msteams(payload: MSTeamsLoginRequest, pool: asyncpg.Pool = Depen
             raise HTTPException(status_code=401, detail="Invalid Microsoft access token provided.")
             
         ms_data = resp.json()
-        email = ms_data.get("mail") or ms_data.get("userPrincipalName", "")
-        if not email:
+        raw_email = ms_data.get("mail") or ms_data.get("userPrincipalName", "")
+        if not raw_email:
             raise HTTPException(status_code=401, detail="Could not extract email from Microsoft token.")
+        
+        email = raw_email.lower()
             
         name = ms_data.get("displayName", "")
         
@@ -199,7 +213,8 @@ async def sync_token(
             raise HTTPException(status_code=401, detail="Invalid Microsoft access token provided.")
             
         ms_data = resp.json()
-        ms_email = ms_data.get("mail") or ms_data.get("userPrincipalName", "")
+        raw_ms_email = ms_data.get("mail") or ms_data.get("userPrincipalName", "")
+        ms_email = raw_ms_email.lower() if raw_ms_email else ""
     except Exception:
         raise HTTPException(status_code=400, detail="Failed to validate Microsoft token")
 
