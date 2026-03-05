@@ -46,10 +46,14 @@ def _paginate_bucket(bucket: str) -> dict:
     object_count = 0
     total_bytes = 0
 
-    for page in paginator.paginate(Bucket=bucket):
-        for obj in page.get("Contents", []):
-            object_count += 1
-            total_bytes += obj.get("Size", 0)
+    try:
+        for page in paginator.paginate(Bucket=bucket):
+            for obj in page.get("Contents", []):
+                object_count += 1
+                total_bytes += obj.get("Size", 0)
+    except Exception as e:
+        print(f"S3 pagination error: {e}")
+        object_count = -1
 
     return {"object_count": object_count, "total_bytes": total_bytes}
 
